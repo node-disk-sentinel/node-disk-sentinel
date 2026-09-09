@@ -1,0 +1,51 @@
+# Container image settings
+image:
+  repository: ghcr.io/node-disk-sentinel/node-disk-sentinel
+  # Overrides the image tag whose default is the chart appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Interval between periodic SMART and hardware discovery polling cycles.
+pollInterval: "10m"
+
+# Quiet period to buffer rapid bursts of udev device events before triggering reconcile.
+eventDebounce: "1s"
+
+# Timeout for each individual smartctl execution.
+smartctlTimeout: "30s"
+
+# Exclude disks from discovery using comma-separated exact matches (node, name, vendor,
+# model, serial, wwn, bus). Every field in a rule must match; multiple rules are alternatives.
+discovery:
+  exclude: []
+  # - "vendor=HP,model=LOGICAL_VOLUME"
+  # - "name=sdn"
+  # - "node=worker-03,serial=ABC123"
+
+# Prometheus metrics and HTTP server configuration.
+metrics:
+  # Enable the Prometheus /metrics endpoint. When set to false, /healthz and /readyz remain
+  # active for pod liveness and readiness probes while /metrics returns 404.
+  enabled: true
+  # Port for the HTTP server serving /healthz, /readyz, and /metrics.
+  port: 8080
+  # Prometheus Operator ServiceMonitor integration.
+  serviceMonitor:
+    # Set to true to create a ServiceMonitor resource for automated scraping.
+    # Requires the Prometheus Operator CRDs to be installed in the cluster.
+    enabled: false
+    # Scraping interval for the ServiceMonitor.
+    interval: 30s
+
+# Tolerations applied to the DaemonSet pods. By default, runs on all nodes (including control plane).
+tolerations:
+  - operator: Exists
+
+# Compute resources allocated to the DaemonSet container.
+resources:
+  limits:
+    cpu: 200m
+    memory: 256Mi
+  requests:
+    cpu: 50m
+    memory: 64Mi

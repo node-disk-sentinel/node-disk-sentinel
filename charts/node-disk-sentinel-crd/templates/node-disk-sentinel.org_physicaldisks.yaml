@@ -1,0 +1,331 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.17.2
+    helm.sh/resource-policy: keep
+  name: physicaldisks.node-disk-sentinel.org
+spec:
+  group: node-disk-sentinel.org
+  names:
+    kind: PhysicalDisk
+    listKind: PhysicalDiskList
+    plural: physicaldisks
+    shortNames:
+    - pd
+    singular: physicaldisk
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.nodeName
+      name: Node
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="DataCollected")].reason
+      name: Collection
+      type: string
+    - jsonPath: .status.health
+      name: Health
+      type: string
+    - jsonPath: .status.info.model
+      name: Model
+      type: string
+    - jsonPath: .status.info.rotational
+      name: Rotational
+      type: boolean
+    - jsonPath: .status.info.capacity
+      name: Capacity
+      type: integer
+    - jsonPath: .status.telemetry.temperatureCelsius
+      name: Temp
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: PhysicalDisk is the Schema for the physicaldisks API.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: PhysicalDiskSpec defines the desired state of PhysicalDisk.
+            properties:
+              nodeName:
+                description: NodeName is the name of the Kubernetes Node where this
+                  disk resides.
+                maxLength: 253
+                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                type: string
+                x-kubernetes-validations:
+                - message: nodeName is immutable once set
+                  rule: self == oldSelf
+              smartmontools:
+                description: Smartmontools defines optional Smartmontools collector
+                  configuration.
+                properties:
+                  smartctl:
+                    description: Smartctl configures the smartctl collector.
+                    properties:
+                      extraCmdArgs:
+                        description: |-
+                          ExtraCmdArgs specifies additional smartctl command-line arguments
+                          (e.g. "-d sat -T permissive").
+                        maxLength: 256
+                        type: string
+                    type: object
+                type: object
+            required:
+            - nodeName
+            type: object
+          status:
+            description: PhysicalDiskStatus defines the observed state of PhysicalDisk.
+            properties:
+              conditions:
+                description: Conditions represents the latest available observations
+                  of a disk's state.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              findings:
+                description: Findings lists any active diagnostic findings, errors,
+                  or threshold breaches.
+                items:
+                  description: Finding represents a specific SMART attribute violation
+                    or diagnostic observation.
+                  properties:
+                    attributeId:
+                      description: AttributeID is the numeric SMART attribute ID (if
+                        ATA).
+                      type: integer
+                    attributeName:
+                      description: AttributeName is the human-readable attribute or
+                        metric name.
+                      type: string
+                    id:
+                      description: ID is an internal identifier for this finding.
+                      type: string
+                    message:
+                      description: Message provides a diagnostic explanation of the
+                        finding.
+                      type: string
+                    rawValue:
+                      description: RawValue is the raw value recorded for this attribute.
+                      format: int64
+                      type: integer
+                  required:
+                  - id
+                  - message
+                  type: object
+                type: array
+              health:
+                allOf:
+                - enum:
+                  - Good
+                  - SectorErrors
+                  - ExcessiveSectorErrors
+                  - AttributeFailingNow
+                  - AttributeFailedInPast
+                  - SelfAssessmentFailed
+                  - Unknown
+                - enum:
+                  - Good
+                  - SectorErrors
+                  - ExcessiveSectorErrors
+                  - AttributeFailingNow
+                  - AttributeFailedInPast
+                  - SelfAssessmentFailed
+                  - Unknown
+                description: |-
+                  Health reflects the evaluated health status (e.g. Good, ExcessiveSectorErrors).
+                  Invariant: health == conditions[Degraded].reason
+                type: string
+              info:
+                description: Info contains static and udev-reported hardware metadata.
+                properties:
+                  bus:
+                    description: Bus subsystem or transport (e.g. ata, scsi, nvme,
+                      usb).
+                    type: string
+                  busPath:
+                    description: BusPath is the hardware bus topology path.
+                    type: string
+                  canonicalPath:
+                    description: CanonicalPath is the kernel device path resolved
+                      from udev (e.g. /dev/sda, /dev/nvme0n1).
+                    type: string
+                  capacity:
+                    description: Capacity is the total disk size in bytes.
+                    format: int64
+                    type: integer
+                  firmwareVersion:
+                    description: FirmwareVersion is the firmware revision of the drive.
+                    type: string
+                  links:
+                    description: Links lists all symlinks pointing to this device
+                      (e.g. by-id, by-path).
+                    items:
+                      type: string
+                    type: array
+                  major:
+                    description: Major device number.
+                    type: integer
+                  minor:
+                    description: Minor device number.
+                    type: integer
+                  model:
+                    description: Model identifier reported by hardware or udev.
+                    type: string
+                  name:
+                    description: Name is the kernel device name (e.g. sda, nvme0n1).
+                    type: string
+                  path:
+                    description: Path is the primary canonical or persistent device
+                      path (e.g. /dev/disk/by-id/wwn-...).
+                    type: string
+                  rotational:
+                    description: Rotational indicates whether the disk is a rotational
+                      medium (HDD) or non-rotational (SSD/NVMe).
+                    type: boolean
+                  serial:
+                    description: Serial number of the device.
+                    type: string
+                  serialShort:
+                    description: SerialShort is the shortened serial number from udev.
+                    type: string
+                  sysPath:
+                    description: SysPath is the sysfs path (e.g. /sys/devices/...).
+                    type: string
+                  type:
+                    description: Type of device (e.g. disk).
+                    type: string
+                  vendor:
+                    description: Vendor identifier.
+                    type: string
+                  wwn:
+                    description: WWN is the World Wide Name identifier.
+                    type: string
+                type: object
+              lastDataCollectedTime:
+                description: LastDataCollectedTime is the timestamp of the last successful
+                  data collection.
+                format: date-time
+                type: string
+              telemetry:
+                description: Telemetry contains the latest observed operational snapshot
+                  of the disk.
+                properties:
+                  availableSpare:
+                    description: AvailableSpare is the percentage of remaining spare
+                      capacity (NVMe).
+                    type: integer
+                  criticalWarning:
+                    description: CriticalWarning is the NVMe critical warning bitmask.
+                    type: integer
+                  mediaErrors:
+                    description: MediaErrors is the number of unrecovered data integrity
+                      errors (NVMe).
+                    format: int64
+                    type: integer
+                  pendingSectors:
+                    description: PendingSectors is the number of pending sectors (ATA
+                      197).
+                    format: int64
+                    type: integer
+                  percentageUsed:
+                    description: PercentageUsed is the percentage of NVM subsystem
+                      life used (NVMe).
+                    type: integer
+                  powerCycleCount:
+                    description: PowerCycleCount is the number of power cycles.
+                    format: int64
+                    type: integer
+                  powerOnHours:
+                    description: PowerOnHours is the lifetime power-on hours of the
+                      device.
+                    format: int64
+                    type: integer
+                  reallocatedSectors:
+                    description: ReallocatedSectors is the number of reallocated sectors
+                      (ATA 5).
+                    format: int64
+                    type: integer
+                  temperatureCelsius:
+                    description: TemperatureCelsius is the current temperature of
+                      the device in Celsius.
+                    type: integer
+                type: object
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

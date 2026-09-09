@@ -1,0 +1,19 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: nds-dev
+nodes:
+  - role: control-plane
+    extraMounts:
+      # Mount host /dev/disk and udev metadata into the node.
+      # Note: Do not mount root /dev or /sys directly as this breaks container systemd/cgroups.
+      - hostPath: /dev/disk
+        containerPath: /dev/disk
+      - hostPath: /run/udev/data
+        containerPath: /run/udev/data
+        readOnly: true
+    extraPortMappings:
+      # Map daemonset metrics port (hostNetwork: true) to host port 8080
+      - containerPort: 8080
+        hostPort: 8080
+        listenAddress: "0.0.0.0"
+        protocol: TCP

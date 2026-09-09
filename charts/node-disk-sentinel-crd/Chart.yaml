@@ -1,0 +1,15 @@
+apiVersion: v2
+name: node-disk-sentinel-crd
+description: CustomResourceDefinitions for the Kubernetes node disk health and telemetry operator
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://node-disk-sentinel.org
+sources:
+  - https://github.com/node-disk-sentinel/node-disk-sentinel
+keywords:
+  - storage
+  - disk
+  - crd
+  - smartctl
+

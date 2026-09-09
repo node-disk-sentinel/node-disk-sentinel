@@ -1,0 +1,168 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test & Validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Run CI checks (Verify API, Lint, Test, Build)
+        run: make ci
+
+  package:
+    name: Build & Publish Container Image
+    needs: test
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine Version
+        id: version
+        run: |
+          if [[ ! "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release tags must use SemVer, for example v0.2.0 or v0.2.0-rc1." >&2
+            exit 1
+          fi
+          VERSION=$(git describe --tags --always --match 'v*' --abbrev=12 2>/dev/null || echo "${GITHUB_SHA::12}")
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          flavor: |
+            latest=auto
+          tags: |
+            type=semver,pattern={{raw}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push multi-arch image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: build/Dockerfile
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
+          platforms: linux/amd64,linux/arm64
+          provenance: false
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release-charts:
+    name: Package & Publish Helm Charts
+    needs: package
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.14.0
+
+      - name: Log in to GitHub Container Registry for Helm OCI
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Package & Push OCI Helm Charts
+        env:
+          REGISTRY_OWNER: ${{ github.repository_owner }}
+        run: |
+          # Strip leading 'v' for SemVer chart version (e.g. v0.1.0 -> 0.1.0)
+          RAW_TAG="${GITHUB_REF#refs/tags/v}"
+          APP_VERSION="v${RAW_TAG}"
+
+          echo "Packaging charts with version ${RAW_TAG} and appVersion ${APP_VERSION} ..."
+
+          mkdir -p .packaged-charts
+          helm package ./charts/node-disk-sentinel-crd \
+            --version "${RAW_TAG}" \
+            --app-version "${APP_VERSION}" \
+            --destination .packaged-charts
+
+          helm package ./charts/node-disk-sentinel \
+            --version "${RAW_TAG}" \
+            --app-version "${APP_VERSION}" \
+            --destination .packaged-charts
+
+          # Push OCI packages to ghcr.io
+          # Note: Helm OCI registry path must be lowercase
+          LOWER_OWNER=$(echo "${REGISTRY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          for chart in .packaged-charts/*.tgz; do
+            helm push "${chart}" "oci://ghcr.io/${LOWER_OWNER}/charts"
+          done
+
+      - name: Generate static install manifest
+        run: |
+          RAW_TAG="${GITHUB_REF#refs/tags/v}"
+          mkdir -p .release-assets
+          {
+            helm template node-disk-sentinel-crd ./charts/node-disk-sentinel-crd \
+              --namespace nds-system
+            echo "---"
+            helm template node-disk-sentinel ./charts/node-disk-sentinel \
+              --namespace nds-system \
+              --set image.tag="v${RAW_TAG}"
+          } > .release-assets/node-disk-sentinel-install.yaml
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            .packaged-charts/*.tgz
+            .release-assets/node-disk-sentinel-install.yaml
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
