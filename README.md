@@ -1,8 +1,9 @@
-# Kubernetes Node Disk Health & Telemetry Operator
+# Node Disk Sentinel
 
-A Kubernetes-native DaemonSet that discovers physical disks on every node,
-publishes their health and telemetry in cluster-scoped `PhysicalDisk` resources,
-and exports disk metrics to Prometheus.
+> **Disk failure is inevitable. Downtime isn’t.**  
+> Predict and handle failing Kubernetes node disks before workloads are impacted.
+
+Continuous SMART assessment for every node disk, with Kubernetes resources and Prometheus metrics for the response workflow you already use.
 
 ## Architecture
 
