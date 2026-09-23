@@ -23,7 +23,7 @@ type AssessmentResult struct {
 // Origin and specification references:
 //
 // 1. ATA Cascade:
-// Derived from Lennart Poettering's libatasmart (specifically upstream commit
+// Derived from libatasmart (specifically upstream commit
 // df3b96ab43fa24730455e8042c4649cab5692733 "Drop our own 'many bad sectors' heuristic"):
 //
 //	Level 1 - SelfAssessmentFailed: Overall SMART health self-test failed (smart_status.passed == false

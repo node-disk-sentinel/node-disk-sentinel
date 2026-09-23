@@ -20,6 +20,14 @@ Continuous SMART assessment for every node disk, with Kubernetes resources and P
   broadcasts. The DaemonSet also mounts the host `/dev`, `/run/udev/data`, and
   `/sys` paths and runs privileged to invoke `smartctl` against host devices.
 
+### Design Principles & Separation of Concerns
+
+Node Disk Sentinel strictly separates operational state from time-series telemetry:
+
+- **Kubernetes CRs (`PhysicalDisk`) are for orchestration and state:** Custom Resources store hardware metadata, current evaluated health, and compact operational conditions. They intentionally never store historical data. This enables cluster-native automation and `kubectl` visibility without creating runtime dependencies on external monitoring APIs.
+- **Prometheus is for time series:** Continuous telemetry, wear-level trend analysis, downsampling, and Alertmanager integrations are handled via the built-in Prometheus exporter (`:8080/metrics`), which is fully compatible with `prometheus-community/smartctl_exporter` and existing Grafana dashboards.
+- **Minimal etcd footprint:** With a default 10-minute polling cycle (`--poll-interval=10m`), etcd write load remains negligible even in large clusters (e.g. ~1 write/sec across a 100-node cluster with 600 drives).
+
 ## Status Model
 
 `PhysicalDisk.status.health` is one of `Good`, `SectorErrors`,
@@ -28,7 +36,7 @@ Continuous SMART assessment for every node disk, with Kubernetes resources and P
 
 ### Health Assessment Cascade
 
-Drive health is assessed using a deterministic, prioritized multi-protocol severity cascade (first match wins):
+Drive health is assessed using a deterministic, prioritized multi-protocol severity cascade (first match wins). The evaluation model is grounded in formal storage specifications and large-scale empirical failure research: the Linux standard **`libatasmart`** cascade for ATA, the official **NVM Express Base Specification**, the **SCSI Primary Commands (SPC)** standard, and empirical research (such as Backblaze drive reliability statistics that confirm sector reallocation and pending counts as the primary leading indicators of disk failure):
 
 1. **ATA Disks** (derived from the severity cascade of `libatasmart`):
    - `SelfAssessmentFailed`: Drive overall-health test failed (`smart_status.passed == false` or smartctl exit bit 3).
