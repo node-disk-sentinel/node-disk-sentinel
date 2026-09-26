@@ -38,6 +38,17 @@ spec:
         - --poll-interval={{ .Values.pollInterval }}
         - --event-debounce={{ .Values.eventDebounce }}
         - --smartctl-timeout={{ .Values.smartctlTimeout }}
+        {{- if hasKey .Values "kmsg" }}
+        {{- if hasKey .Values.kmsg "enabled" }}
+        - --kmsg-enabled={{ .Values.kmsg.enabled }}
+        {{- end }}
+        {{- if .Values.kmsg.path }}
+        - --kmsg-path={{ .Values.kmsg.path }}
+        {{- end }}
+        {{- if .Values.kmsg.debounce }}
+        - --kmsg-debounce={{ .Values.kmsg.debounce }}
+        {{- end }}
+        {{- end }}
         {{- range .Values.discovery.exclude }}
         {{- if . }}
         - {{ printf "--exclude-disk=%s" . | quote }}

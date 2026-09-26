@@ -8,7 +8,7 @@ import (
 )
 
 // DiskHealthStatus represents the evaluated health status of a disk.
-// +kubebuilder:validation:Enum=Good;SectorErrors;ExcessiveSectorErrors;AttributeFailingNow;AttributeFailedInPast;SelfAssessmentFailed;Unknown
+// +kubebuilder:validation:Enum=Good;SectorErrors;ExcessiveSectorErrors;AttributeFailingNow;AttributeFailedInPast;SelfAssessmentFailed;KernelErrors;Unknown
 type DiskHealthStatus string
 
 const (
@@ -18,6 +18,7 @@ const (
 	StatusAttributeFailingNow   DiskHealthStatus = "AttributeFailingNow"
 	StatusAttributeFailedInPast DiskHealthStatus = "AttributeFailedInPast"
 	StatusSelfAssessmentFailed  DiskHealthStatus = "SelfAssessmentFailed"
+	StatusKernelErrors          DiskHealthStatus = "KernelErrors"
 	StatusUnknown               DiskHealthStatus = "Unknown"
 )
 
@@ -30,6 +31,7 @@ var AllDiskHealthStatuses = []DiskHealthStatus{
 	StatusAttributeFailingNow,
 	StatusAttributeFailedInPast,
 	StatusSelfAssessmentFailed,
+	StatusKernelErrors,
 	StatusUnknown,
 }
 
@@ -171,7 +173,7 @@ type Finding struct {
 type PhysicalDiskStatus struct {
 	// Health reflects the evaluated health status (e.g. Good, ExcessiveSectorErrors).
 	// Invariant: health == conditions[Degraded].reason
-	// +kubebuilder:validation:Enum=Good;SectorErrors;ExcessiveSectorErrors;AttributeFailingNow;AttributeFailedInPast;SelfAssessmentFailed;Unknown
+	// +kubebuilder:validation:Enum=Good;SectorErrors;ExcessiveSectorErrors;AttributeFailingNow;AttributeFailedInPast;SelfAssessmentFailed;KernelErrors;Unknown
 	Health DiskHealthStatus `json:"health,omitempty"`
 
 	// LastDataCollectedTime is the timestamp of the last successful data collection.

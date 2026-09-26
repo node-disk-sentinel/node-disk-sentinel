@@ -14,6 +14,15 @@ eventDebounce: "1s"
 # Timeout for each individual smartctl execution.
 smartctlTimeout: "30s"
 
+# Kernel log (/dev/kmsg) monitoring for real-time block layer I/O errors.
+kmsg:
+  enabled: true
+  path: "/dev/kmsg"
+  # Quiet period to buffer rapid bursts of kernel storage error events before triggering reconcile.
+  # Set higher than eventDebounce (5s vs 1s) to allow kernel SCSI error recovery and drive firmware
+  # bad sector reallocation to settle before smartctl queries the drive.
+  debounce: "5s"
+
 # Exclude disks from discovery using comma-separated exact matches (node, name, vendor,
 # model, serial, wwn, bus). Every field in a rule must match; multiple rules are alternatives.
 discovery:

@@ -25,6 +25,7 @@ import (
 
 	"github.com/votdev/node-disk-sentinel/pkg/apis/node-disk-sentinel.org/v1alpha1"
 	"github.com/votdev/node-disk-sentinel/pkg/discovery"
+	"github.com/votdev/node-disk-sentinel/pkg/kernellog"
 	"github.com/votdev/node-disk-sentinel/pkg/metrics"
 	"github.com/votdev/node-disk-sentinel/pkg/smartmontools"
 	"github.com/votdev/node-disk-sentinel/pkg/utils"
@@ -459,6 +460,9 @@ func TestNewDiskMonitorAppliesSafeDefaults(t *testing.T) {
 	if monitor.Options.EventDebounce != defaultEventDebounce {
 		t.Errorf("eventDebounce = %s; want %s", monitor.Options.EventDebounce, defaultEventDebounce)
 	}
+	if monitor.Options.KmsgDebounce != defaultKmsgDebounce {
+		t.Errorf("kmsgDebounce = %s; want %s", monitor.Options.KmsgDebounce, defaultKmsgDebounce)
+	}
 }
 
 // Any custom smartctl extraCmdArgs configured in spec must be passed to the runner.
@@ -888,5 +892,297 @@ func TestMarkDiskMissing_Idempotent(t *testing.T) {
 		t.Errorf("unexpected duplicate event on second markDiskMissing: %s", event)
 	default:
 		// Expected: no event emitted.
+	}
+}
+
+// TestRecordKernelErrorDoesNotTouchAPI verifies that recordKernelError only
+// buffers in memory: it must not create/modify any PhysicalDisk resource and
+// must not emit a Kubernetes Event, no matter how many times it is called.
+// This is the core guarantee that prevents a burst of kernel log lines from
+// hammering the API server (see mergePendingKernelError for the actual write).
+func TestRecordKernelErrorDoesNotTouchAPI(t *testing.T) {
+	monitor, c, recorder := newTestMonitor(t, &mockSmartctlRunner{output: healthyATADisk()})
+	ctx := context.Background()
+
+	if err := monitor.ReconcileAll(ctx); err != nil {
+		t.Fatalf("ReconcileAll failed: %v", err)
+	}
+	disk := singleDisk(t, c)
+	if disk.Status.Health != v1alpha1.StatusGood {
+		t.Fatalf("health = %q; want Good", disk.Status.Health)
+	}
+	originalResourceVersion := disk.ResourceVersion
+
+	// Drain the initial Good-transition event from the first reconcile above
+	// so it doesn't interfere with the "no event" assertion below.
+	select {
+	case <-recorder.Events:
+	default:
+	}
+
+	// Simulate a burst: 50 kernel log lines for the same device.
+	for i := 0; i < 50; i++ {
+		monitor.recordKernelError(&kernellog.KernelError{
+			RuleID:      kernellog.RuleIDBlockIOError,
+			Description: "Kernel block layer I/O error",
+			Device:      "sda",
+			Sector:      int64(642872 + i),
+			Op:          kernellog.OpWrite,
+			RawMessage:  "I/O error, dev sda, sector ...",
+		})
+	}
+
+	// No API write must have happened: resourceVersion is unchanged.
+	disk = singleDisk(t, c)
+	if disk.Status.Health != v1alpha1.StatusGood {
+		t.Errorf("health = %q; want Good (recordKernelError must not write to the API)", disk.Status.Health)
+	}
+	if disk.ResourceVersion != originalResourceVersion {
+		t.Errorf("resourceVersion changed from %q to %q; recordKernelError must not touch the API",
+			originalResourceVersion, disk.ResourceVersion)
+	}
+	select {
+	case ev := <-recorder.Events:
+		t.Errorf("unexpected event emitted by recordKernelError: %s", ev)
+	default:
+		// Expected: no event.
+	}
+
+	// The buffered burst must be coalesced into a single pending entry.
+	monitor.mu.RLock()
+	pending := monitor.pendingKernelErrors["sda"]
+	monitor.mu.RUnlock()
+	if pending == nil {
+		t.Fatal("expected a pending kernel error entry for sda")
+	}
+	if pending.count != 50 {
+		t.Errorf("pending count = %d; want 50", pending.count)
+	}
+
+	// A single ReconcileAll must now flush the buffered burst into exactly
+	// one Finding, one Degraded transition/event, and one metric increment.
+	if err := monitor.ReconcileAll(ctx); err != nil {
+		t.Fatalf("ReconcileAll after burst failed: %v", err)
+	}
+
+	disk = singleDisk(t, c)
+	if disk.Status.Health != v1alpha1.StatusKernelErrors {
+		t.Errorf("health = %q; want %q", disk.Status.Health, v1alpha1.StatusKernelErrors)
+	}
+	assertHealthInvariant(t, disk)
+
+	var ioFinding *v1alpha1.Finding
+	for _, f := range disk.Status.Findings {
+		if f.ID == kernellog.RuleIDBlockIOError {
+			ioFinding = &f
+			break
+		}
+	}
+	if ioFinding == nil {
+		t.Fatalf("expected %s finding, got: %#v", kernellog.RuleIDBlockIOError, disk.Status.Findings)
+	}
+	if ioFinding.RawValue != 642872+49 {
+		t.Errorf("finding rawValue = %d; want %d (latest sector)", ioFinding.RawValue, 642872+49)
+	}
+
+	if count := testutil.CollectAndCount(metrics.KernelErrors); count < 1 {
+		t.Errorf("expected KernelErrors metric to be incremented, got count %d", count)
+	}
+
+	// The pending buffer must be drained (consumed exactly once).
+	monitor.mu.RLock()
+	_, stillPending := monitor.pendingKernelErrors["sda"]
+	monitor.mu.RUnlock()
+	if stillPending {
+		t.Error("expected pending kernel error to be consumed after reconcile")
+	}
+}
+
+// TestRecordKernelErrorIgnoresUnknownDevice verifies that a buffered error for
+// a device with no corresponding PhysicalDisk (e.g. filtered/excluded/unrelated
+// host device) never affects any disk's health.
+func TestRecordKernelErrorIgnoresUnknownDevice(t *testing.T) {
+	monitor, c, _ := newTestMonitor(t, &mockSmartctlRunner{output: healthyATADisk()})
+	ctx := context.Background()
+
+	if err := monitor.ReconcileAll(ctx); err != nil {
+		t.Fatalf("ReconcileAll failed: %v", err)
+	}
+
+	monitor.recordKernelError(&kernellog.KernelError{
+		RuleID:      kernellog.RuleIDBlockIOError,
+		Description: "Kernel block layer I/O error",
+		Device:      "sdz",
+		Sector:      12345,
+		Op:          kernellog.OpRead,
+		RawMessage:  "I/O error, dev sdz, sector 12345",
+	})
+
+	if err := monitor.ReconcileAll(ctx); err != nil {
+		t.Fatalf("ReconcileAll failed: %v", err)
+	}
+
+	disk := singleDisk(t, c)
+	if disk.Status.Health != v1alpha1.StatusGood {
+		t.Errorf("expected health to remain Good for unrelated disk, got %q", disk.Status.Health)
+	}
+}
+
+// TestIsKnownDeviceFilter verifies that isKnownDevice only accepts devices
+// that currently back a monitored PhysicalDisk, and stops accepting a device
+// once its disk has been marked missing (forgetDevice).
+func TestIsKnownDeviceFilter(t *testing.T) {
+	monitor, c, _ := newTestMonitor(t, &mockSmartctlRunner{output: healthyATADisk()})
+	ctx := context.Background()
+
+	if monitor.isKnownDevice("sda") {
+		t.Error("sda must not be known before the first reconcile")
+	}
+
+	if err := monitor.ReconcileAll(ctx); err != nil {
+		t.Fatalf("ReconcileAll failed: %v", err)
+	}
+	if !monitor.isKnownDevice("sda") {
+		t.Error("sda must be known after reconcile")
+	}
+	if monitor.isKnownDevice("sdz") {
+		t.Error("sdz must not be known")
+	}
+
+	disk := singleDisk(t, c)
+	if err := monitor.markDiskMissing(ctx, &disk, "test removal"); err != nil {
+		t.Fatalf("markDiskMissing failed: %v", err)
+	}
+	if monitor.isKnownDevice("sda") {
+		t.Error("sda must no longer be known after markDiskMissing")
+	}
+}
+
+func TestKernelErrorNoAutoHealingAndUpgrade(t *testing.T) {
+	monitor, c, _ := newTestMonitor(t, &mockSmartctlRunner{output: healthyATADisk()})
+	ctx := context.Background()
+
+	if err := monitor.ReconcileAll(ctx); err != nil {
+		t.Fatalf("ReconcileAll failed: %v", err)
+	}
+
+	// Trigger kernel storage error, then flush it via the first reconcile.
+	monitor.recordKernelError(&kernellog.KernelError{
+		RuleID:      kernellog.RuleIDBlockIOError,
+		Description: "Kernel block layer I/O error",
+		Device:      "sda",
+		Sector:      642872,
+		Op:          kernellog.OpWrite,
+		RawMessage:  "I/O error, dev sda, sector 642872 op 0x1:(WRITE)",
+	})
+	if err := monitor.ReconcileAll(ctx); err != nil {
+		t.Fatalf("first ReconcileAll failed: %v", err)
+	}
+
+	disk := singleDisk(t, c)
+	if disk.Status.Health != v1alpha1.StatusKernelErrors {
+		t.Fatalf("health = %q; want %q", disk.Status.Health, v1alpha1.StatusKernelErrors)
+	}
+
+	// Reconcile with healthy SMART data: MUST NOT HEAL back to Good!
+	if err := monitor.ReconcileAll(ctx); err != nil {
+		t.Fatalf("second ReconcileAll failed: %v", err)
+	}
+
+	disk = singleDisk(t, c)
+	if disk.Status.Health != v1alpha1.StatusKernelErrors {
+		t.Errorf("health healed to %q; want it to stay %q", disk.Status.Health, v1alpha1.StatusKernelErrors)
+	}
+	assertHealthInvariant(t, disk)
+
+	// Reconcile with failing SMART data (e.g. failingATADisk): MUST UPGRADE to SelfAssessmentFailed!
+	monitor.SmartRunner = &mockSmartctlRunner{output: failingATADisk()}
+	if err := monitor.ReconcileAll(ctx); err != nil {
+		t.Fatalf("third ReconcileAll failed: %v", err)
+	}
+
+	disk = singleDisk(t, c)
+	if disk.Status.Health != v1alpha1.StatusSelfAssessmentFailed {
+		t.Errorf("health = %q; want %q", disk.Status.Health, v1alpha1.StatusSelfAssessmentFailed)
+	}
+	assertHealthInvariant(t, disk)
+
+	// Finding KERNEL_BLOCK_IO_ERROR must still be preserved even after upgrading!
+	if !hasKernelFinding(disk.Status.Findings) {
+		t.Errorf("expected %s finding to be preserved after SMART failure", kernellog.RuleIDBlockIOError)
+	}
+}
+
+func TestDiskMonitorStartWithKmsgReader(t *testing.T) {
+	monitor, c, recorder := newTestMonitor(t, &mockSmartctlRunner{output: healthyATADisk()})
+	chanReader := kernellog.NewChannelReader(10)
+	monitor.KmsgReader = chanReader
+	monitor.Options.KmsgEnabled = true
+	monitor.Options.EventDebounce = 10 * time.Millisecond
+	monitor.Options.KmsgDebounce = 10 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- monitor.Start(ctx)
+	}()
+
+	// Wait until monitor is ready.
+	for i := 0; i < 50; i++ {
+		if monitor.Ready() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !monitor.Ready() {
+		t.Fatal("DiskMonitor did not become ready in time")
+	}
+
+	disk := singleDisk(t, c)
+	if disk.Status.Health != v1alpha1.StatusGood {
+		t.Fatalf("initial health = %q; want Good", disk.Status.Health)
+	}
+
+	// Inject a kernel block I/O error on sda.
+	chanReader.C <- "blk_update_request: I/O error, dev sda, sector 987654 op 0x1:(WRITE)"
+
+	// Verify that the disk health degrades to KernelErrors.
+	var degradedDisk v1alpha1.PhysicalDisk
+	var found bool
+	for i := 0; i < 50; i++ {
+		degradedDisk = singleDisk(t, c)
+		if degradedDisk.Status.Health == v1alpha1.StatusKernelErrors {
+			found = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if !found {
+		t.Fatalf("expected health to degrade to %q, got %q",
+			v1alpha1.StatusKernelErrors, degradedDisk.Status.Health)
+	}
+	assertHealthInvariant(t, degradedDisk)
+
+	// Check event emitted.
+	select {
+	case ev := <-recorder.Events:
+		if ev == "" {
+			t.Errorf("expected event on kernel error")
+		}
+	default:
+		t.Errorf("expected event channel to have an event")
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("monitor.Start exited with error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("monitor.Start did not stop after cancel")
 	}
 }

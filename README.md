@@ -15,7 +15,12 @@ Continuous SMART assessment for every node disk, with Kubernetes resources and P
   cluster-scoped `PhysicalDisk` resources.
 - It polls disks every 10 minutes by default and listens for udev-processed
   Netlink add, change, online, remove, and offline events. Add/change bursts
-  are coalesced before a full inventory refresh.
+  are coalesced before a full inventory refresh (`--event-debounce=1s`).
+- It streams Linux kernel messages (`/dev/kmsg`) in real time to instantly detect
+  hardware and block layer errors (`I/O error, dev ...`, SCSI sense errors, NVMe
+  timeouts). Errors are buffered and debounced (`--kmsg-debounce=5s`) to allow
+  kernel error recovery (SCSI aborts/resets) to settle before triggering an immediate
+  SMART re-scan, attaching diagnostic findings, and degrading disk health (`KernelErrors`).
 - `hostNetwork: true` is required so the monitor can receive host udev Netlink
   broadcasts. The DaemonSet also mounts the host `/dev`, `/run/udev/data`, and
   `/sys` paths and runs privileged to invoke `smartctl` against host devices.
@@ -32,7 +37,7 @@ Node Disk Sentinel strictly separates operational state from time-series telemet
 
 `PhysicalDisk.status.health` is one of `Good`, `SectorErrors`,
 `ExcessiveSectorErrors`, `AttributeFailingNow`, `AttributeFailedInPast`,
-`SelfAssessmentFailed`, or `Unknown`.
+`SelfAssessmentFailed`, `KernelErrors`, or `Unknown`.
 
 ### Health Assessment Cascade
 
@@ -108,6 +113,7 @@ and community Grafana dashboards (such as dashboard `22604`):
 - `smartctl_device_attribute`: SMART attributes (raw, value, worst, threshold).
 - `smartctl_device_health_status`: Evaluated disk health status gauge (`Good`, `SectorErrors`, etc.).
 - `smartctl_device_collection_success`: Last SMART data collection result (`1` = success, `0` = failure).
+- `node_disk_sentinel_kernel_errors_total`: Counter tracking kernel-reported storage errors (block/buffer I/O, SCSI sense, NVMe controller) by operation (`WRITE`, `READ`, etc.).
 
 Every metric includes `node`, `disk`, and `device` labels alongside standard `smartctl_exporter` labels. All readings of a
 detached disk are automatically pruned to prevent stale metric export.

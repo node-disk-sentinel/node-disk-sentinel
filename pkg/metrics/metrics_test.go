@@ -22,6 +22,7 @@ func TestMetricsRegistrationAndDeletion(t *testing.T) {
 	PowerCycleCount.WithLabelValues(node, disk, device).Set(12.0)
 	HealthStatus.WithLabelValues(node, disk, device, "Good").Set(1.0)
 	CollectionSuccess.WithLabelValues(node, disk, device).Set(1.0)
+	KernelErrors.WithLabelValues(node, disk, device, "WRITE").Inc()
 
 	if count := testutil.CollectAndCount(Device); count < 1 {
 		t.Errorf("expected Device metric to be recorded, got count %d", count)
@@ -29,13 +30,19 @@ func TestMetricsRegistrationAndDeletion(t *testing.T) {
 	if count := testutil.CollectAndCount(Temperature); count < 1 {
 		t.Errorf("expected Temperature metric to be recorded, got count %d", count)
 	}
+	if count := testutil.CollectAndCount(KernelErrors); count < 1 {
+		t.Errorf("expected KernelErrors metric to be recorded, got count %d", count)
+	}
 
 	// Delete device health metrics on device removal.
 	DeleteDeviceHealthMetrics(node, disk)
 
-	// Device, Temperature, and HealthStatus should be deleted.
+	// Device, Temperature, HealthStatus, and KernelErrors should be deleted.
 	if count := testutil.CollectAndCount(Temperature); count != 0 {
 		t.Errorf("expected Temperature metric to be deleted, got count %d", count)
+	}
+	if count := testutil.CollectAndCount(KernelErrors); count != 0 {
+		t.Errorf("expected KernelErrors metric to be deleted, got count %d", count)
 	}
 
 	// CollectionSuccess must be preserved.
