@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -28,6 +30,7 @@ import (
 	"github.com/votdev/node-disk-sentinel/pkg/apis/node-disk-sentinel.org/v1alpha1"
 	"github.com/votdev/node-disk-sentinel/pkg/assessment"
 	"github.com/votdev/node-disk-sentinel/pkg/discovery"
+	"github.com/votdev/node-disk-sentinel/pkg/kernellog"
 	"github.com/votdev/node-disk-sentinel/pkg/metrics"
 	"github.com/votdev/node-disk-sentinel/pkg/smartmontools"
 	"github.com/votdev/node-disk-sentinel/pkg/utils"
@@ -36,6 +39,7 @@ import (
 const (
 	defaultPollInterval  = 10 * time.Minute
 	defaultEventDebounce = time.Second
+	defaultKmsgDebounce  = 5 * time.Second
 
 	// monitorRetryInterval is the pause before the udev monitor is restarted.
 	monitorRetryInterval = 10 * time.Second
@@ -48,7 +52,17 @@ type MonitorOptions struct {
 	UdevDataDir   string // udev runtime database, defaults to /run/udev/data
 	PollInterval  time.Duration
 	EventDebounce time.Duration
+	KmsgDebounce  time.Duration
 	ExcludeRules  []discovery.ExcludeRule
+	KmsgEnabled   bool
+	KmsgPath      string
+}
+
+// pendingKernelError buffers a not-yet-flushed kernel-reported storage error
+// for a single device, coalescing repeated occurrences between reconcile cycles.
+type pendingKernelError struct {
+	err   *kernellog.KernelError
+	count int64
 }
 
 // DiskMonitor coordinates local udev disk discovery, periodic inventory scans,
@@ -57,6 +71,7 @@ type DiskMonitor struct {
 	client.Client
 	Recorder    record.EventRecorder
 	SmartRunner smartmontools.Runner
+	KmsgReader  kernellog.Reader
 	Options     MonitorOptions
 
 	// watch reports inventory changes by calling trigger until ctx is done. It
@@ -65,6 +80,21 @@ type DiskMonitor struct {
 
 	nodeRef atomic.Pointer[corev1.Node]
 	ready   atomic.Bool
+
+	// kmsgMu guards knownDevices and pendingKernelErrors, which are shared by
+	// the kernel log reader goroutine and the scan loop.
+	kmsgMu sync.Mutex
+
+	// knownDevices tracks kernel device names (e.g. "sdb") currently backed by
+	// a monitored PhysicalDisk on this node. It is consulted by the kmsg
+	// listener's filter so that log lines for excluded, virtual, or foreign
+	// devices are dropped before ever reaching the reconcile path.
+	knownDevices map[string]struct{}
+
+	// pendingKernelErrors buffers kernel storage errors detected since the
+	// last scan of a given device. reconcileDisk drains it, so a burst of
+	// kernel log lines costs one API write per device and scan, not one per line.
+	pendingKernelErrors map[string]*pendingKernelError
 }
 
 // NewDiskMonitor creates a new DiskMonitor instance.
@@ -75,12 +105,17 @@ func NewDiskMonitor(c client.Client, recorder record.EventRecorder, runner smart
 	if opts.EventDebounce <= 0 {
 		opts.EventDebounce = defaultEventDebounce
 	}
+	if opts.KmsgDebounce <= 0 {
+		opts.KmsgDebounce = defaultKmsgDebounce
+	}
 	return &DiskMonitor{
-		Client:      c,
-		Recorder:    recorder,
-		SmartRunner: runner,
-		Options:     opts,
-		watch:       discovery.Monitor,
+		Client:              c,
+		Recorder:            recorder,
+		SmartRunner:         runner,
+		Options:             opts,
+		watch:               discovery.Monitor,
+		knownDevices:        make(map[string]struct{}),
+		pendingKernelErrors: make(map[string]*pendingKernelError),
 	}
 }
 
@@ -197,6 +232,17 @@ func (m *DiskMonitor) Start(ctx context.Context) error {
 	ticker := time.NewTicker(m.Options.PollInterval)
 	defer ticker.Stop()
 
+	// kmsgDirty is the kernel-log counterpart of dirty: the buffered errors are
+	// applied by the next scan, and any number of log lines collapse into one.
+	kmsgDirty := make(chan struct{}, 1)
+	stopKmsg := m.startKmsgListener(ctx, func() {
+		select {
+		case kmsgDirty <- struct{}{}:
+		default:
+		}
+	})
+	defer stopKmsg()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -207,14 +253,24 @@ func (m *DiskMonitor) Start(ctx context.Context) error {
 			// hot-plug) and announce themselves one by one. Wait a fixed delay after
 			// the first hint instead of restarting a timer on every event, so a
 			// steady event stream cannot postpone the scan indefinitely.
-			select {
-			case <-time.After(m.Options.EventDebounce):
-			case <-ctx.Done():
+			if !sleepContext(ctx, m.Options.EventDebounce) {
 				return nil
 			}
 			// Hints that arrived during the window are covered by this scan.
 			select {
 			case <-dirty:
+			default:
+			}
+		case <-kmsgDirty:
+			// Longer than the udev delay so the kernel can finish error recovery
+			// before smartctl queries the drive (see the package documentation).
+			// Counted from the first line, so continuous errors cannot postpone
+			// the report.
+			if !sleepContext(ctx, m.Options.KmsgDebounce) {
+				return nil
+			}
+			select {
+			case <-kmsgDirty:
 			default:
 			}
 		}
@@ -226,10 +282,209 @@ func (m *DiskMonitor) Start(ctx context.Context) error {
 	}
 }
 
+// sleepContext waits for d and reports false if ctx ended first.
+func sleepContext(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// startKmsgListener streams kernel log messages about block device I/O errors
+// into the pending-error buffer and calls trigger after each one. The returned
+// function waits until the listener has stopped; it stops when ctx is done.
+func (m *DiskMonitor) startKmsgListener(ctx context.Context, trigger func()) func() {
+	if !m.Options.KmsgEnabled {
+		return func() {}
+	}
+
+	events := make(chan *kernellog.KernelError, 64)
+	done := make(chan struct{})
+	consumed := make(chan struct{})
+
+	go func() {
+		defer close(consumed)
+		for kErr := range events {
+			m.recordKernelError(kErr)
+			klog.V(4).InfoS("Queueing scan for kernel storage error",
+				"device", kErr.Device, "rule", kErr.RuleID, "sector", kErr.Sector, "op", kErr.Op)
+			trigger()
+		}
+	}()
+
+	go func() {
+		defer close(done)
+		defer close(events)
+
+		for {
+			reader := m.KmsgReader
+			if reader == nil {
+				var err error
+				reader, err = kernellog.NewKmsgReader(m.Options.KmsgPath)
+				if err != nil {
+					klog.ErrorS(err, "Failed to start kernel message listener; retrying in 30s", "path", m.Options.KmsgPath)
+					select {
+					case <-time.After(30 * time.Second):
+						continue
+					case <-ctx.Done():
+						return
+					}
+				}
+			}
+
+			klog.InfoS("Kernel log message listener active", "path", m.Options.KmsgPath)
+			monitor := kernellog.NewMonitor(reader, m.isKnownDevice)
+			if err := monitor.Listen(ctx, events); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				klog.ErrorS(err, "Kernel log listener stopped with error; reconnecting in 10s")
+				select {
+				case <-time.After(10 * time.Second):
+					continue
+				case <-ctx.Done():
+					return
+				}
+			} else {
+				if ctx.Err() != nil {
+					return
+				}
+				klog.Warning("Kernel log listener stopped unexpectedly; reconnecting in 10s")
+				select {
+				case <-time.After(10 * time.Second):
+					continue
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+
+	return func() {
+		<-done
+		<-consumed
+	}
+}
+
+// isKnownDevice reports whether dev currently backs a monitored PhysicalDisk
+// on this node. Used as the kmsg listener's filter so that log lines for
+// excluded, virtual, or foreign devices never reach the reconcile path.
+func (m *DiskMonitor) isKnownDevice(dev string) bool {
+	m.kmsgMu.Lock()
+	defer m.kmsgMu.Unlock()
+	_, ok := m.knownDevices[dev]
+	return ok
+}
+
+// rememberDevice marks dev as currently backed by a monitored PhysicalDisk.
+func (m *DiskMonitor) rememberDevice(dev string) {
+	if dev == "" {
+		return
+	}
+	m.kmsgMu.Lock()
+	defer m.kmsgMu.Unlock()
+	m.knownDevices[dev] = struct{}{}
+}
+
+// forgetDevice removes dev from the known-device index and drops any not-yet-
+// flushed kernel error buffered for it, e.g. when the disk is removed or excluded.
+func (m *DiskMonitor) forgetDevice(dev string) {
+	if dev == "" {
+		return
+	}
+	m.kmsgMu.Lock()
+	defer m.kmsgMu.Unlock()
+	delete(m.knownDevices, dev)
+	delete(m.pendingKernelErrors, dev)
+}
+
+// recordKernelError buffers a detected kernel storage error in memory. It makes
+// no API calls: repeated errors for the same device share one buffered entry,
+// which mergePendingKernelError drains during the next scan.
+func (m *DiskMonitor) recordKernelError(kErr *kernellog.KernelError) {
+	m.kmsgMu.Lock()
+	defer m.kmsgMu.Unlock()
+	if p, ok := m.pendingKernelErrors[kErr.Device]; ok {
+		p.err = kErr
+		p.count++
+	} else {
+		m.pendingKernelErrors[kErr.Device] = &pendingKernelError{err: kErr, count: 1}
+	}
+}
+
+// mergePendingKernelError drains any kernel error buffered for disk's device and,
+// if present, attaches/updates the corresponding Finding and increments the
+// kernel error metric. It does not touch disk.Status.Health directly; the health
+// merge (prioritizing confirmed SMART findings, never auto-healing a kernel error
+// away) happens uniformly in applyCollectionSuccess/applyCollectionFailure based
+// on the resulting Findings, exactly like every other diagnostic source.
+func (m *DiskMonitor) mergePendingKernelError(disk *v1alpha1.PhysicalDisk) {
+	device := disk.Status.Info.Name
+
+	m.kmsgMu.Lock()
+	p, ok := m.pendingKernelErrors[device]
+	if ok {
+		delete(m.pendingKernelErrors, device)
+	}
+	m.kmsgMu.Unlock()
+	if !ok {
+		return
+	}
+
+	kErr := p.err
+	metrics.KernelErrors.WithLabelValues(m.Options.NodeName, disk.Name, disk.Status.Info.Path, string(kErr.Op)).Add(float64(p.count))
+
+	findingID := kErr.RuleID
+	if findingID == "" {
+		findingID = kernellog.FindingIDPrefix + "ERROR"
+	}
+	// Sector is -1 when the kernel message does not name one (SCSI/NVMe rules);
+	// neither print nor store that sentinel as if it were a real sector.
+	findingMsg := fmt.Sprintf("%s on dev %s (op %s)", kErr.Description, kErr.Device, kErr.Op)
+	rawValue := int64(0)
+	if kErr.Sector >= 0 {
+		findingMsg = fmt.Sprintf("%s on dev %s (op %s, sector %d)", kErr.Description, kErr.Device, kErr.Op, kErr.Sector)
+		rawValue = kErr.Sector
+	}
+	if p.count > 1 {
+		findingMsg = fmt.Sprintf("%s [x%d since last check]", findingMsg, p.count)
+	}
+
+	// The health condition only emits an event on a state transition. A disk that
+	// is already degraded (e.g. by SMART) would otherwise get no notification when
+	// new kernel I/O errors show up, so report every drained batch explicitly.
+	m.recordEvent(disk, corev1.EventTypeWarning, "KernelIOError",
+		fmt.Sprintf("Disk %s: %s", disk.Status.Info.Path, findingMsg))
+
+	findingUpdated := false
+	for j := range disk.Status.Findings {
+		if disk.Status.Findings[j].ID == findingID {
+			disk.Status.Findings[j].RawValue = rawValue
+			disk.Status.Findings[j].Message = findingMsg
+			findingUpdated = true
+			break
+		}
+	}
+	if !findingUpdated {
+		disk.Status.Findings = append(disk.Status.Findings, v1alpha1.Finding{
+			ID:            findingID,
+			AttributeName: "KernelStorage",
+			RawValue:      rawValue,
+			Message:       findingMsg,
+		})
+	}
+}
+
 func (m *DiskMonitor) markDiskMissing(ctx context.Context, disk *v1alpha1.PhysicalDisk, message string) error {
 	// Readings of a detached disk must not keep being exported.
 	metrics.DeleteDeviceHealthMetrics(m.Options.NodeName, disk.Name)
 	metrics.CollectionSuccess.WithLabelValues(m.Options.NodeName, disk.Name, disk.Status.Info.Path).Set(0)
+	// Stop accepting kmsg lines for this device and drop any buffered error.
+	m.forgetDevice(disk.Status.Info.Name)
 
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var latestDisk v1alpha1.PhysicalDisk
@@ -324,6 +579,7 @@ func (m *DiskMonitor) deleteIfExcluded(ctx context.Context, disk *v1alpha1.Physi
 		return false, fmt.Errorf("failed to delete excluded PhysicalDisk %s: %w", disk.Name, err)
 	}
 	metrics.DeleteAllDiskMetrics(m.Options.NodeName, disk.Name)
+	m.forgetDevice(disk.Status.Info.Name)
 	klog.InfoS("Deleted excluded physical disk",
 		"disk", disk.Name, "path", disk.Status.Info.Path, "rule", rule.String())
 	return true, nil
@@ -372,6 +628,12 @@ func (m *DiskMonitor) reconcileDisk(ctx context.Context, diskInfo v1alpha1.DiskI
 	base := physicalDisk.DeepCopy()
 	physicalDisk.Status.Info = diskInfo
 
+	// Mark this device as known so the kmsg listener's filter accepts kernel
+	// log lines for it, and drain any kernel error buffered since the last
+	// reconcile of this disk (see recordKernelError/mergePendingKernelError).
+	m.rememberDevice(diskInfo.Name)
+	m.mergePendingKernelError(&physicalDisk)
+
 	var extraCmdArgs string
 	if physicalDisk.Spec.Smartmontools != nil && physicalDisk.Spec.Smartmontools.Smartctl != nil {
 		extraCmdArgs = physicalDisk.Spec.Smartmontools.Smartctl.ExtraCmdArgs
@@ -416,6 +678,17 @@ func (m *DiskMonitor) ownerReferences() []metav1.OwnerReference {
 	}}
 }
 
+// hasKernelFinding reports whether findings contains any kernel-log-derived
+// diagnostic entry (see kernellog.FindingIDPrefix).
+func hasKernelFinding(findings []v1alpha1.Finding) bool {
+	for _, f := range findings {
+		if strings.HasPrefix(f.ID, kernellog.FindingIDPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *DiskMonitor) applyCollectionFailure(disk *v1alpha1.PhysicalDisk, diskInfo v1alpha1.DiskInfo, collectErr error) {
 	metrics.CollectionSuccess.WithLabelValues(m.Options.NodeName, disk.Name, diskInfo.Path).Set(0)
 
@@ -448,9 +721,21 @@ func (m *DiskMonitor) applyCollectionFailure(disk *v1alpha1.PhysicalDisk, diskIn
 
 	// A failed collection says nothing about the hardware itself, so a
 	// previously determined health status and telemetry are preserved.
-	// Only a disk that was never assessed is reported as Unknown.
-	if disk.Status.Health == "" {
-		m.setHealth(disk, v1alpha1.StatusUnknown)
+	// A disk that was never assessed is reported as Unknown, unless a kernel
+	// storage error was just merged for it (mergePendingKernelError runs
+	// before SMART collection in reconcileDisk), in which case it is reported
+	// as KernelErrors immediately instead of waiting for the next successful
+	// SMART poll to notice the finding.
+	switch {
+	case disk.Status.Health == "":
+		if hasKernelFinding(disk.Status.Findings) {
+			m.setHealth(disk, v1alpha1.StatusKernelErrors)
+		} else {
+			m.setHealth(disk, v1alpha1.StatusUnknown)
+		}
+	case hasKernelFinding(disk.Status.Findings) &&
+		(disk.Status.Health == v1alpha1.StatusGood || disk.Status.Health == v1alpha1.StatusAttributeFailedInPast):
+		m.setHealth(disk, v1alpha1.StatusKernelErrors)
 	}
 }
 
@@ -469,9 +754,33 @@ func (m *DiskMonitor) applyCollectionSuccess(disk *v1alpha1.PhysicalDisk, diskIn
 	})
 
 	assessmentResult := assessment.Evaluate(smartData)
+
+	// Preserve any existing kernel storage findings across SMART collections.
+	var kernelFindings []v1alpha1.Finding
+	for _, f := range disk.Status.Findings {
+		if strings.HasPrefix(f.ID, kernellog.FindingIDPrefix) {
+			kernelFindings = append(kernelFindings, f)
+		}
+	}
+
 	disk.Status.Findings = assessmentResult.Findings
-	m.setHealth(disk, assessmentResult.Status)
-	m.publishHealthMetrics(disk, diskInfo, smartData, assessmentResult.Status)
+	if len(kernelFindings) > 0 {
+		disk.Status.Findings = append(disk.Status.Findings, kernelFindings...)
+	}
+
+	// Determine final health status:
+	// Confirmed hardware errors from SMART (SelfAssessmentFailed, ExcessiveSectorErrors,
+	// AttributeFailingNow, SectorErrors) take precedence.
+	// If SMART reports Good or AttributeFailedInPast, but this disk has experienced
+	// kernel storage errors, it remains degraded as StatusKernelErrors (no auto-healing).
+	finalStatus := assessmentResult.Status
+	if hasKernelFinding(disk.Status.Findings) &&
+		(finalStatus == v1alpha1.StatusGood || finalStatus == v1alpha1.StatusAttributeFailedInPast) {
+		finalStatus = v1alpha1.StatusKernelErrors
+	}
+
+	m.setHealth(disk, finalStatus)
+	m.publishHealthMetrics(disk, diskInfo, smartData, finalStatus)
 }
 
 // extractTelemetry builds a compact snapshot of operational data from smartctl output.

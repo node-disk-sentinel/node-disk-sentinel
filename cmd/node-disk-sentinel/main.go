@@ -53,6 +53,9 @@ type options struct {
 	eventDebounce   time.Duration
 	smartctlTimeout time.Duration
 	excludeDisks    []string
+	kmsgEnabled     bool
+	kmsgPath        string
+	kmsgDebounce    time.Duration
 }
 
 func (o *options) bindFlags() {
@@ -72,6 +75,12 @@ func (o *options) bindFlags() {
 		o.excludeDisks = append(o.excludeDisks, value)
 		return nil
 	})
+	flag.BoolVar(&o.kmsgEnabled, "kmsg-enabled", true, "Enable real-time kernel log monitoring for disk I/O errors")
+	flag.StringVar(&o.kmsgPath, "kmsg-path", "/dev/kmsg", "Path to host kernel log character device")
+	// kmsgDebounce lets a burst of kernel storage error log lines share a single
+	// reconcile, and gives the kernel's error recovery time to finish before
+	// smartctl queries the drive.
+	flag.DurationVar(&o.kmsgDebounce, "kmsg-debounce", 5*time.Second, "Delay after the first kernel storage error line, so that a burst of errors causes one reconcile")
 }
 
 func (o *options) excludeRules() ([]discovery.ExcludeRule, error) {
@@ -95,6 +104,9 @@ func (o *options) validate() error {
 	}
 	if o.eventDebounce < 0 {
 		return fmt.Errorf("--event-debounce must not be negative, got %s", o.eventDebounce)
+	}
+	if o.kmsgDebounce < 0 {
+		return fmt.Errorf("--kmsg-debounce must not be negative, got %s", o.kmsgDebounce)
 	}
 	if o.smartctlTimeout <= 0 {
 		return fmt.Errorf("--smartctl-timeout must be greater than zero, got %s", o.smartctlTimeout)
@@ -211,7 +223,10 @@ func run(opts *options) error {
 			UdevDataDir:   opts.udevDataDir,
 			PollInterval:  opts.pollInterval,
 			EventDebounce: opts.eventDebounce,
+			KmsgDebounce:  opts.kmsgDebounce,
 			ExcludeRules:  excludeRules,
+			KmsgEnabled:   opts.kmsgEnabled,
+			KmsgPath:      opts.kmsgPath,
 		},
 	)
 

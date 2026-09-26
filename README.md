@@ -18,6 +18,12 @@ Continuous SMART assessment for every node disk, with Kubernetes resources and P
   bursts of events are coalesced. Events are only a hint: the refresh always
   re-reads sysfs and the udev database, and it also runs whenever the listener
   (re)connects, so no change is missed.
+- It streams Linux kernel messages (`/dev/kmsg`) in real time to instantly detect
+  hardware and block layer errors (`I/O error, dev ...`, SCSI sense errors, NVMe
+  timeouts). Errors are buffered in memory. A fixed delay after the first one
+  (`--kmsg-debounce=5s`) lets kernel error recovery (SCSI aborts/resets) settle;
+  then a SMART re-scan runs, diagnostic findings are attached, and the disk health
+  is degraded (`KernelErrors`) without waiting for the next poll.
 - `hostNetwork: true` is required so the monitor can receive host udev Netlink
   broadcasts. The DaemonSet also mounts the host `/dev`, `/run/udev/data`, and
   `/sys` paths and runs privileged to invoke `smartctl` against host devices.
@@ -34,7 +40,7 @@ Node Disk Sentinel strictly separates operational state from time-series telemet
 
 `PhysicalDisk.status.health` is one of `Good`, `SectorErrors`,
 `ExcessiveSectorErrors`, `AttributeFailingNow`, `AttributeFailedInPast`,
-`SelfAssessmentFailed`, or `Unknown`.
+`SelfAssessmentFailed`, `KernelErrors`, or `Unknown`.
 
 ### Health Assessment Cascade
 
@@ -58,6 +64,8 @@ Drive health is assessed using a deterministic, prioritized multi-protocol sever
    - `SelfAssessmentFailed`: Self-assessment reported failure.
    - `SectorErrors`: `TotalUncorrectedErrors > 0` in SCSI read or write error counter logs.
    - `Good`: Zero uncorrected read/write errors.
+
+4. **Kernel Errors** (all protocols, from `/dev/kmsg`): A block layer, SCSI or NVMe error logged for the disk attaches a `KERNEL_*` finding. The finding survives later SMART collections: a disk that SMART reports as `Good` or `AttributeFailedInPast` stays at `KernelErrors` and does not heal until the drive is replaced. Any more severe status from the cascade above takes precedence.
 
 The resource reports two conditions:
 
@@ -110,6 +118,7 @@ and community Grafana dashboards (such as dashboard `22604`):
 - `smartctl_device_attribute`: SMART attributes (raw, value, worst, threshold).
 - `smartctl_device_health_status`: Evaluated disk health status gauge (`Good`, `SectorErrors`, etc.).
 - `smartctl_device_collection_success`: Last SMART data collection result (`1` = success, `0` = failure).
+- `node_disk_sentinel_kernel_errors_total`: Counter tracking kernel-reported storage errors (block layer I/O, SCSI sense, NVMe controller) by operation (`WRITE`, `READ`, etc.).
 
 Every metric except `smartctl_version` includes `node`, `disk`, and `device` labels alongside standard `smartctl_exporter` labels
 (`smartctl_version` carries only `node`). All readings of a detached disk are automatically pruned to prevent stale metric export.

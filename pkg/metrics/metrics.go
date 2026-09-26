@@ -175,6 +175,18 @@ var (
 		},
 		[]string{"node", "disk", "device"},
 	)
+
+	// KernelErrors exposes the total number of kernel-reported storage errors
+	// (block layer I/O errors, SCSI sense errors, NVMe
+	// controller errors, etc.) detected for a device.
+	KernelErrors = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "node_disk_sentinel",
+			Name:      "kernel_errors_total",
+			Help:      "Total number of kernel-reported storage errors detected for this device",
+		},
+		[]string{"node", "disk", "device", "op"},
+	)
 )
 
 func init() {
@@ -194,6 +206,7 @@ func init() {
 		Attribute,
 		HealthStatus,
 		CollectionSuccess,
+		KernelErrors,
 	)
 }
 
@@ -225,6 +238,7 @@ func DeleteDeviceHealthMetrics(node, disk string) {
 	NumErrLogEntries.DeletePartialMatch(labels)
 	Attribute.DeletePartialMatch(labels)
 	HealthStatus.DeletePartialMatch(labels)
+	KernelErrors.DeletePartialMatch(labels)
 }
 
 // DeleteAllDiskMetrics drops all metrics for a disk, including CollectionSuccess.

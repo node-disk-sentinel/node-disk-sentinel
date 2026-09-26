@@ -98,3 +98,25 @@ Node Disk Sentinel's evaluation cascade is grounded in formal storage specificat
 - **NVMe Drives (NVM Express Base Specification):** Evaluates hardware-level indicators defined in the official NVMe specification, specifically the `Critical Warning` bitmask (temperature, degraded reliability, read-only mode, volatile memory backup failure), `Available Spare` capacity against warning thresholds, and `Percentage Used` (endurance).
 - **SCSI / SAS Disks (SCSI Primary Commands / SPC):** Monitors the SCSI error counter log (`scsi_error_counter_log`) for uncorrected read and write errors, as defined by the SPC standard.
 - **Empirical Failure Research (Backblaze Drive Stats):** The SMART statistics Backblaze published in 2016 ([What SMART Stats Tell Us About Hard Drives](https://www.backblaze.com/blog/what-smart-stats-indicate-hard-drive-failures/)) track five attributes (SMART 5, 187, 188, 197 and 198). 76.7 % of the failed drives, but only 4.2 % of the operational ones, had a raw value above zero in at least one of them. Node Disk Sentinel evaluates the raw counts of `Reallocated Sectors` (ATA 5) and `Current Pending Sectors` (ATA 197) and treats NVMe `Media Errors` as the analogous signal; a non-zero count is reported as `SectorErrors` even if no manufacturer threshold is breached. The Backblaze data covers hard drives only.
+
+---
+
+### How does Node Disk Sentinel detect kernel block I/O errors and why does it use `/dev/kmsg` instead of `systemd-journald`?
+
+In addition to periodic SMART polling cycles (every 10 minutes), Node Disk Sentinel monitors the Linux kernel log buffer (`/dev/kmsg`) in real time to capture active storage and block layer I/O errors (e.g. `I/O error, dev sdb, sector 642872 op 0x1:(WRITE)`).
+
+**Why `/dev/kmsg` instead of `systemd-journald`?**
+1. **Zero CGO & Self-Contained Static Binary:** Node Disk Sentinel is built with `CGO_ENABLED=0` to run in minimal, distroless, or Alpine-based containers without requiring host C-runtime shared libraries (`libsystemd.so`).
+2. **Distribution & OS Agnostic:** Systemd journal files are specific to distributions running `systemd-journald`. Directly reading `/dev/kmsg` allows Node Disk Sentinel to operate reliably across any Linux environment (including Talos Linux, Flatcar, or minimal container hosts) without requiring host `/var/log/journal` volume mounts.
+3. **Hardware-Centric Persistence:** Storage drives that produce physical I/O errors do not spontaneously heal. When a kernel I/O error is detected, the drive is marked as degraded (`KernelErrors`) by the next scan, which starts after the `--kmsg-debounce` delay and also runs a SMART re-scan; a Kubernetes Warning event is emitted at the same time. Subsequent routine SMART polling cycles reporting "Good" will never heal the disk back to Good; the degraded state persists in the `PhysicalDisk` custom resource in `etcd` until the drive is replaced.
+
+---
+
+### What is the difference between `--event-debounce` and `--kmsg-debounce`?
+
+Node Disk Sentinel employs two independent delays to collapse event storms into one reconciliation. Each is counted from the first event, so a continuous stream cannot postpone the scan indefinitely:
+
+| Setting | Default | Purpose & Characteristics |
+| :--- | :--- | :--- |
+| **`--event-debounce`** | `1s` | **Udev Netlink Hotplug Events:** When a disk is physically plugged in, the Linux kernel generates a flurry of uevents (disk registration, partition table scanning, udev helper rules). This burst naturally settles within 200–500ms. A short 1-second delay after the first event allows fast hardware discovery without delaying Kubernetes orchestration. |
+| **`--kmsg-debounce`** | `5s` | **Kernel Storage / I/O Errors:** When a drive experiences physical I/O failures, the Linux kernel initiates SCSI/SATA error recovery (command aborts, device/bus/link resets, driver retries), and drive firmware updates internal bad-sector reallocation counters. These recovery sequences typically take 3–5 seconds. A 5-second delay after the first error line ensures that kernel error recovery and firmware register updates settle *before* Node Disk Sentinel queries the drive with `smartctl`, preventing device-busy locks (`EBUSY`) or premature SMART readings. |
