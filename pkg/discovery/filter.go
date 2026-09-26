@@ -1,8 +1,9 @@
 // Copyright 2026 Volker Theile
 // SPDX-License-Identifier: Apache-2.0
 
-// Package discovery provides filtering rules to separate real, physical drives
-// from virtual block devices, software abstractions, and drive partitions.
+// This file provides filtering rules to separate real, physical drives from
+// virtual block devices, software abstractions, and drive partitions.
+
 package discovery
 
 import (

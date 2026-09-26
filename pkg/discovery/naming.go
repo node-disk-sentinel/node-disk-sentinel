@@ -1,8 +1,10 @@
 // Copyright 2026 Volker Theile
 // SPDX-License-Identifier: Apache-2.0
 
-// Package discovery provides predictable path resolution and Kubernetes-compatible
-// deterministic naming for physical storage hardware.
+// This file provides predictable path resolution and Kubernetes-compatible
+// deterministic naming for physical storage hardware. See doc.go for the full
+// predictable path hierarchy and naming rationale.
+
 package discovery
 
 import (
@@ -20,36 +22,8 @@ var (
 )
 
 // ResolvePredictablePath selects the most stable and persistent device path.
-//
-// In the Linux kernel, device letters (/dev/sda, /dev/sdb, etc.) are assigned
-// dynamically and asynchronously based on the order storage controllers and
-// SATA/SAS/PCIe lanes finish driver initialization during boot.
-// - If a drive responds 50ms slower on one reboot, /dev/sda and /dev/sdb can swap.
-// - If a USB drive is plugged in during boot, it might steal /dev/sda.
-// - If an SAS controller resets or hot-plugs a disk, the letter changes.
-//
-// systemd-udev solves this by creating persistent symlinks under /dev/disk/.
-// ResolvePredictablePath evaluates all available symlinks and selects the most
-// immutable path according to this strict hierarchy:
-//
-//  1. /dev/disk/by-id/wwn-* (World Wide Name):
-//     IEEE standard 64-bit or 128-bit globally unique hardware identifier burned
-//     into drive firmware by the factory. Survives cable swaps, controller changes,
-//     and server motherboard replacements.
-//
-//  2. /dev/disk/by-id/nvme-eui.* (NVMe Extended Unique Identifier):
-//     IEEE EUI-64 globally unique identifier assigned to NVMe namespaces.
-//
-//  3. /dev/disk/by-id/ata-*, nvme-*, scsi-* (Serial Number & Model):
-//     Constructed from the drive's inquiry serial number and model name. Highly
-//     persistent across reboots on the same machine.
-//
-//  4. /dev/disk/by-path/* (Physical Bus Topology):
-//     Encodes the physical PCI slot, SAS channel, and port (e.g. pci-0000:00:1f.2-ata-1).
-//     Guarantees predictability based on physical enclosure slot location.
-//
-//  5. Canonical kernel device path (/dev/<devname>):
-//     Last-resort fallback if udev symlinks were not generated or mounted.
+// See the package documentation (doc.go) for why kernel device letters are
+// unstable and the full priority hierarchy of persistent udev symlinks evaluated.
 func ResolvePredictablePath(devName string, links []string) string {
 	var (
 		wwnLink     string

@@ -1,6 +1,8 @@
 // Copyright 2026 Volker Theile
 // SPDX-License-Identifier: Apache-2.0
 
+// Package metrics defines and exports Prometheus time-series metrics compatible
+// with smartctl_exporter and community monitoring dashboards.
 package metrics
 
 import (

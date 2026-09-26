@@ -36,9 +36,9 @@ Node Disk Sentinel strictly separates operational state from time-series telemet
 
 ### Health Assessment Cascade
 
-Drive health is assessed using a deterministic, prioritized multi-protocol severity cascade (first match wins). The evaluation model is grounded in formal storage specifications and large-scale empirical failure research: the Linux standard **`libatasmart`** cascade for ATA, the official **NVM Express Base Specification**, the **SCSI Primary Commands (SPC)** standard, and empirical research (such as Backblaze drive reliability statistics that confirm sector reallocation and pending counts as the primary leading indicators of disk failure):
+Drive health is assessed using a deterministic, prioritized multi-protocol severity cascade (first match wins). The evaluation model is grounded in formal storage specifications, empirical failure research, and proven concepts from the Linux storage ecosystem:
 
-1. **ATA Disks** (derived from the severity cascade of `libatasmart`):
+1. **ATA Disks** (incorporating tiered severity concepts inspired by `libatasmart`):
    - `SelfAssessmentFailed`: Drive overall-health test failed (`smart_status.passed == false` or smartctl exit bit 3).
    - `ExcessiveSectorErrors`: Reallocated (ATA 5) or pending (ATA 197) sectors breached manufacturer threshold (`when_failed == "failing_now"`).
    - `AttributeFailingNow`: Any other pre-failure attribute currently failing its manufacturer threshold.

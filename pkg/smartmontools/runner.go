@@ -1,6 +1,8 @@
 // Copyright 2026 Volker Theile
 // SPDX-License-Identifier: Apache-2.0
 
+// Package smartmontools provides execution wrappers and structured JSON models
+// for querying drive SMART and diagnostic telemetry via smartctl.
 package smartmontools
 
 import (

@@ -1,67 +1,10 @@
 // Copyright 2026 Volker Theile
 // SPDX-License-Identifier: Apache-2.0
 
-// Package discovery handles host disk detection by parsing udev's runtime database
-// and sysfs attributes directly, avoiding any reliance on external CLI tools like 'udevadm'.
-//
-// ============================================================================
-// Linux udev Runtime Database & sysfs Architecture
-// ============================================================================
-//
-// 1. The /run/udev/data Runtime Database:
-//   - On modern Linux distributions using systemd, 'systemd-udevd' manages a
-//     high-speed in-memory database located at /run/udev/data (mounted on tmpfs;
-//     historically /dev/.udev/db on pre-systemd distributions).
-//   - Why read files directly instead of calling 'udevadm info'?
-//     Executing 'udevadm' in a subprocess for every disk forks a process, dynamically
-//     links libraries, and parses output on stdout. On large storage nodes with dozens
-//     or hundreds of disks, this incurs significant CPU and latency overhead.
-//     Furthermore, in containerized Kubernetes DaemonSets (especially distroless or
-//     scratch images), the 'udevadm' binary is often absent. By mounting the host's
-//     /run/udev/data read-only into the container, node-disk-sentinel discovers all
-//     hardware metadata in microseconds with zero binary dependencies.
-//   - This is a runtime cache, not durable inventory. Because /run is tmpfs, udev
-//     rebuilds it after each host boot. A record can also disappear while a scan is
-//     in progress during hot removal. Discovery therefore treats individual unreadable
-//     records as transient and relies on the next event or periodic scan to converge.
-//
-// 2. File Naming Convention: b<major>:<minor> vs c<major>:<minor>:
-//
-//   - The Linux kernel uniquely addresses device nodes using a (type, major, minor) tuple:
-//     'b' indicates a block device (disks, partitions, loopback).
-//     'c' indicates a character device (ttys, mice, hardware random generators).
-//     'major' identifies the kernel device driver/subsystem:
-//     8   = SCSI disk subsystem (SATA, SAS, USB mass storage: /dev/sd*)
-//     259 = NVMe subsystem (/dev/nvme*n*)
-//     254 = Device Mapper (/dev/dm-*)
-//     'minor' identifies the specific drive or partition instance within that driver.
-//
-//   - Consequently, udev names each database file after this exact tuple:
-//     /run/udev/data/b8:0   -> Block device 8:0 (/dev/sda - whole disk)
-//     /run/udev/data/b8:1   -> Block device 8:1 (/dev/sda1 - first partition)
-//     /run/udev/data/b259:0 -> Block device 259:0 (/dev/nvme0n1 - NVMe namespace)
-//
-//     3. Database Syntax (Tag Prefixes):
-//     Each line in a /run/udev/data file begins with a single-character tag and colon:
-//
-//   - S:<symlink>
-//     Persistent symlinks created under /dev for this device, stored relative to /dev
-//     (e.g. "S:disk/by-id/ata-WDC_WD10EZEX...", "S:disk/by-path/pci-...").
-//
-//   - E:<KEY>=<VALUE>
-//     Environment variables populated by udev rules (e.g. ata_id, scsi_id, blkid):
-//     DEVNAME, DEVTYPE, ID_BUS, ID_MODEL, ID_SERIAL, ID_WWN, etc.
-//
-//   - G:<tag>, W:<watch>, A:<attr>
-//     Tags, inotify watch descriptors, and cached sysfs attributes (ignored by our parser).
-//
-// 4. Sysfs Fallbacks (/sys/dev/block/<major>:<minor>):
-//   - In virtualized or cloud environments (QEMU/KVM with VirtIO-blk, cloud-init,
-//     or trimmed container rootfs), udev records can occasionally omit DEVNAME or DEVTYPE.
-//   - Linux sysfs exposes a deterministic lookup directory at /sys/dev/block/<major>:<minor>.
-//     This is a symlink resolving to the full kobject path under /sys/devices/.../block/<name>.
-//     By resolving this link with filepath.EvalSymlinks, we can reliably recover the
-//     canonical device name and inspect sysfs attributes directly.
+// This file handles host disk detection by parsing udev's runtime database and
+// sysfs attributes directly, avoiding any reliance on external CLI tools like
+// 'udevadm'. See doc.go for the full udev database and sysfs architecture notes.
+
 package discovery
 
 import (

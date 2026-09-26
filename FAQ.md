@@ -92,9 +92,9 @@ No. Node Disk Sentinel is designed explicitly to avoid treating `etcd` as a time
 
 ### What industry standards and research is the health assessment based on?
 
-Node Disk Sentinel's evaluation cascade is grounded in formal storage specifications and peer-reviewed empirical failure research:
+Node Disk Sentinel's evaluation cascade is grounded in formal storage specifications, empirical failure research, and established industry concepts:
 
-- **ATA Disks (`libatasmart`):** The ATA evaluation logic implements the prioritized severity cascade from `libatasmart`, the long-standing Linux library utilized across major distributions and disk management utilities.
+- **ATA Disks:** The ATA evaluation logic incorporates proven tiered-severity concepts inspired by `libatasmart`, prioritizing manufacturer-calibrated thresholds over synthetic heuristics to avoid false positives.
 - **NVMe Drives (NVM Express Base Specification):** Evaluates hardware-level indicators defined in the official NVMe specification, specifically the `Critical Warning` bitmask (temperature, degraded reliability, read-only mode, volatile memory backup failure), `Available Spare` capacity against warning thresholds, and `Percentage Used` (endurance).
 - **SCSI / SAS Disks (SCSI Primary Commands / SPC):** Monitors SCSI error counter logs (`scsi_error_counter_log`) and grown defect lists for uncorrected read/write errors as defined by the SPC and SBC standards.
 - **Empirical Failure Research (Backblaze Drive Stats):** Large-scale reliability studies on hundreds of thousands of operational drives have demonstrated that bad sectors, specifically raw counts of `Reallocated Sectors` (ATA 5) and `Current Pending Sectors` (ATA 197), as well as NVMe Media Errors, are the strongest statistical leading indicators of impending drive failure, well before manufacturer thresholds are breached or overall self-tests fail.
