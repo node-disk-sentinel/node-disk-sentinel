@@ -195,6 +195,7 @@ spec:
                   - AttributeFailingNow
                   - AttributeFailedInPast
                   - SelfAssessmentFailed
+                  - KernelErrors
                   - Unknown
                 - enum:
                   - Good
@@ -203,6 +204,7 @@ spec:
                   - AttributeFailingNow
                   - AttributeFailedInPast
                   - SelfAssessmentFailed
+                  - KernelErrors
                   - Unknown
                 description: |-
                   Health reflects the evaluated health status (e.g. Good, ExcessiveSectorErrors).

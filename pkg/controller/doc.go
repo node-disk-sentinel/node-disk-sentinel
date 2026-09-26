@@ -29,13 +29,16 @@
 //      Get/List, triggering duplicate-create errors instead of self-healing. The direct
 //      client guarantees visibility into the authoritative API server state.
 //
-// 3. Debouncing Hardware Event Cascades:
-//    When a storage device is plugged in or partitioned, Linux emits a flurry of uevents
-//    (whole-disk add, partition scanning, blkid/ata_id execution, filesystem probes).
-//    Reconciling synchronously on each individual datagram would hammer the host with
-//    redundant smartctl processes and flood etcd with API updates. DiskMonitor collapses
-//    these bursts using an in-memory quiet period (--event-debounce, default: 1s),
-//    triggering reconciliation only after device activity settles.
+// 3. Dual Debouncing & Storm Protection:
+//    Hardware events occur in sudden bursts. DiskMonitor employs two independent,
+//    in-memory debounce timers to collapse event flurries before reconciling:
+//    - Uevent Hotplug Debounce (--event-debounce, default: 1s): Collapses the rapid
+//      cascade of kernel partition scanning and udev helper rules when a drive is inserted.
+//    - Kernel Error Debounce (--kmsg-debounce, default: 5s): Failing drives under active
+//      load can emit hundreds of block-layer errors per second. DiskMonitor buffers
+//      these in-memory (recordKernelError) and waits for kernel error recovery
+//      (SCSI aborts, link resets) and firmware reallocation to settle before triggering
+//      a consolidated SMART scan and Kubernetes API update.
 //
 // 4. Missing Device Handling & Metrics Cleanup:
 //    When a hot-swap drive is detached, issuing further sysfs or smartctl commands

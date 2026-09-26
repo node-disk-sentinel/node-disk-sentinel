@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestNewServerMux(t *testing.T) {
@@ -116,6 +117,54 @@ func TestOptions_MetricsEnabledFlag(t *testing.T) {
 
 			if opts.metricsEnabled != tt.expected {
 				t.Fatalf("expected metricsEnabled=%v, got %v", tt.expected, opts.metricsEnabled)
+			}
+		})
+	}
+}
+
+func TestOptions_KmsgFlags(t *testing.T) {
+	tests := []struct {
+		name             string
+		args             []string
+		expectedEn       bool
+		expectedPath     string
+		expectedDebounce time.Duration
+	}{
+		{
+			name:             "defaults",
+			args:             []string{},
+			expectedEn:       true,
+			expectedPath:     "/dev/kmsg",
+			expectedDebounce: 5 * time.Second,
+		},
+		{
+			name:             "custom values",
+			args:             []string{"--kmsg-enabled=false", "--kmsg-path=/tmp/test-kmsg", "--kmsg-debounce=10s"},
+			expectedEn:       false,
+			expectedPath:     "/tmp/test-kmsg",
+			expectedDebounce: 10 * time.Second,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fs := flag.NewFlagSet("test", flag.ContinueOnError)
+			opts := &options{}
+			fs.BoolVar(&opts.kmsgEnabled, "kmsg-enabled", true, "")
+			fs.StringVar(&opts.kmsgPath, "kmsg-path", "/dev/kmsg", "")
+			fs.DurationVar(&opts.kmsgDebounce, "kmsg-debounce", 5*time.Second, "")
+
+			if err := fs.Parse(tt.args); err != nil {
+				t.Fatalf("failed to parse flags: %v", err)
+			}
+			if opts.kmsgEnabled != tt.expectedEn {
+				t.Errorf("kmsgEnabled = %v; want %v", opts.kmsgEnabled, tt.expectedEn)
+			}
+			if opts.kmsgPath != tt.expectedPath {
+				t.Errorf("kmsgPath = %v; want %v", opts.kmsgPath, tt.expectedPath)
+			}
+			if opts.kmsgDebounce != tt.expectedDebounce {
+				t.Errorf("kmsgDebounce = %v; want %v", opts.kmsgDebounce, tt.expectedDebounce)
 			}
 		})
 	}
