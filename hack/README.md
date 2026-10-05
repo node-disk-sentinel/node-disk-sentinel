@@ -18,6 +18,9 @@ make monitoring-up
 
 # 4. Check status of pods, CRDs, and metrics
 make status
+
+# 5. (Optional) Inspect cluster interactively with k9s
+make k9s
 ```
 
 ## Service Endpoints & UIs
@@ -60,6 +63,6 @@ This target scans `/proc/partitions` on the host, creates any missing block devi
 
 ## Directory Structure
 
-* `Makefile`: Automates Kind cluster creation, building, loading images, deployment, and monitoring.
+* `Makefile`: Automates Kind cluster creation, building, loading images, deployment, monitoring, and cluster inspection (`k9s`, `status`, `logs`).
 * `kind-config.yaml`: Kind configuration forwarding port `8080` to the host and mounting host `/dev/disk` and `/run/udev/data`. It deliberately does not mount root `/dev` or `/sys`, because those mounts prevent the Kind node's systemd from starting.
 * `monitoring/`: Docker Compose stack containing Prometheus and Grafana configs and the preloaded dashboard.

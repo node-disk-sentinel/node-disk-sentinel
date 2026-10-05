@@ -7,6 +7,8 @@ KIND_VERSION := v0.27.0
 HELM := $(BIN_DIR)/helm
 HELM_VERSION := v3.17.1
 
+K9S ?= k9s
+
 CLUSTER_NAME ?= nds-dev
 MK_HOST_ARCH ?= $(shell uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
 ARCH ?= $(MK_HOST_ARCH)
@@ -16,7 +18,7 @@ VERSION ?= $(shell git describe --tags --always --match 'v*' --abbrev=12 2>/dev/
 IMAGE_REPO ?= ghcr.io/node-disk-sentinel/node-disk-sentinel
 IMAGE_TAG ?= $(VERSION)-$(ARCH)
 
-.PHONY: help cluster-up cluster-down build-image load-image deploy undeploy sync-devices monitoring-up monitoring-down status logs
+.PHONY: help cluster-up cluster-down build-image load-image deploy undeploy sync-devices monitoring-up monitoring-down status logs k9s
 
 help:
 	@echo "Local Development & Testing Environment for node-disk-sentinel"
@@ -35,6 +37,7 @@ help:
 	@echo "  monitoring-down   Stop local Prometheus & Grafana test stack"
 	@echo "  status            Show status of cluster pods, CRDs, and metrics"
 	@echo "  logs              Follow logs of node-disk-sentinel DaemonSet"
+	@echo "  k9s               Start a k9s session for the Kind cluster"
 
 $(BIN_DIR):
 	@mkdir -p $@
@@ -119,3 +122,6 @@ status:
 
 logs:
 	kubectl -n nds-system logs -l app.kubernetes.io/name=node-disk-sentinel -f
+
+k9s:
+	$(K9S) --context kind-$(CLUSTER_NAME) $(K9S_ARGS)
