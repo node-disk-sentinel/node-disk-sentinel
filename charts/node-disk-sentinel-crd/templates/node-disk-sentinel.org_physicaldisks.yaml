@@ -209,18 +209,19 @@ spec:
                   Invariant: health == conditions[Degraded].reason
                 type: string
               info:
-                description: Info contains static and udev-reported hardware metadata.
+                description: Info contains static hardware metadata from sysfs and
+                  the udev database.
                 properties:
                   bus:
-                    description: Bus subsystem or transport (e.g. ata, scsi, nvme,
-                      usb).
+                    description: Bus is the udev ID_BUS of the device (e.g. ata, scsi,
+                      usb); empty if udev sets none, as for NVMe disks.
                     type: string
                   busPath:
                     description: BusPath is the hardware bus topology path.
                     type: string
                   canonicalPath:
-                    description: CanonicalPath is the kernel device path resolved
-                      from udev (e.g. /dev/sda, /dev/nvme0n1).
+                    description: CanonicalPath is the kernel device node (e.g. /dev/sda,
+                      /dev/nvme0n1).
                     type: string
                   capacity:
                     description: Capacity is the total disk size in bytes.
@@ -230,8 +231,8 @@ spec:
                     description: FirmwareVersion is the firmware revision of the drive.
                     type: string
                   links:
-                    description: Links lists all symlinks pointing to this device
-                      (e.g. by-id, by-path).
+                    description: Links lists the udev symlinks of this device, relative
+                      to /dev (e.g. disk/by-id/..., disk/by-path/...).
                     items:
                       type: string
                     type: array
@@ -245,7 +246,8 @@ spec:
                     description: Model identifier reported by hardware or udev.
                     type: string
                   name:
-                    description: Name is the kernel device name (e.g. sda, nvme0n1).
+                    description: Name is the kernel device name as listed in /sys/block
+                      (e.g. sda, nvme0n1).
                     type: string
                   path:
                     description: Path is the primary canonical or persistent device
@@ -262,7 +264,8 @@ spec:
                     description: SerialShort is the shortened serial number from udev.
                     type: string
                   sysPath:
-                    description: SysPath is the sysfs path (e.g. /sys/devices/...).
+                    description: SysPath is the device path below the sysfs mount,
+                      as in udev's DEVPATH (e.g. /devices/pci0000:00/.../block/sda).
                     type: string
                   type:
                     description: Type of device (e.g. disk).

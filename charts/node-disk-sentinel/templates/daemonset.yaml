@@ -15,9 +15,9 @@ spec:
         app.kubernetes.io/name: {{ .Release.Name }}
     spec:
       serviceAccountName: {{ .Release.Name }}
-      # hostNetwork is required so the container's netlink socket receives
-      # kernel block device uevents (add/remove/change), which are broadcast
-      # to the host network namespace only.
+      # hostNetwork is required so the container's netlink socket receives the
+      # block device events (add/remove) that udev broadcasts in the host
+      # network namespace only.
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       hostPID: false

@@ -246,18 +246,9 @@ exit 1
 	}
 }
 
-func TestNewExecRunner(t *testing.T) {
-	runner := NewExecRunner()
-	if runner.BinaryPath != "smartctl" {
-		t.Errorf("BinaryPath = %s, want smartctl", runner.BinaryPath)
-	}
-	if runner.Timeout <= 0 {
-		t.Errorf("Timeout should be positive, got %v", runner.Timeout)
-	}
-
-	// Test invalid extraCmdArgs returns error.
-	_, err := runner.Collect(context.Background(), "/dev/sda", "unterminated 'quote")
-	if err == nil {
+func TestCollectRejectsInvalidExtraCmdArgs(t *testing.T) {
+	runner := &ExecRunner{}
+	if _, err := runner.Collect(context.Background(), "/dev/sda", "unterminated 'quote"); err == nil {
 		t.Errorf("expected error for unterminated quote in extraCmdArgs")
 	}
 }

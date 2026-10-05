@@ -80,17 +80,17 @@ type PhysicalDiskSpec struct {
 	Smartmontools *SmartmontoolsSpec `json:"smartmontools,omitempty"`
 }
 
-// DiskInfo contains static and udev-reported hardware metadata.
+// DiskInfo contains static hardware metadata from sysfs and the udev database.
 type DiskInfo struct {
 	// Path is the primary canonical or persistent device path (e.g. /dev/disk/by-id/wwn-...).
 	Path string `json:"path,omitempty"`
-	// CanonicalPath is the kernel device path resolved from udev (e.g. /dev/sda, /dev/nvme0n1).
+	// CanonicalPath is the kernel device node (e.g. /dev/sda, /dev/nvme0n1).
 	CanonicalPath string `json:"canonicalPath,omitempty"`
-	// Name is the kernel device name (e.g. sda, nvme0n1).
+	// Name is the kernel device name as listed in /sys/block (e.g. sda, nvme0n1).
 	Name string `json:"name,omitempty"`
-	// SysPath is the sysfs path (e.g. /sys/devices/...).
+	// SysPath is the device path below the sysfs mount, as in udev's DEVPATH (e.g. /devices/pci0000:00/.../block/sda).
 	SysPath string `json:"sysPath,omitempty"`
-	// Links lists all symlinks pointing to this device (e.g. by-id, by-path).
+	// Links lists the udev symlinks of this device, relative to /dev (e.g. disk/by-id/..., disk/by-path/...).
 	Links []string `json:"links,omitempty"`
 	// Major device number.
 	Major int `json:"major,omitempty"`
@@ -98,7 +98,7 @@ type DiskInfo struct {
 	Minor int `json:"minor,omitempty"`
 	// Type of device (e.g. disk).
 	Type string `json:"type,omitempty"`
-	// Bus subsystem or transport (e.g. ata, scsi, nvme, usb).
+	// Bus is the udev ID_BUS of the device (e.g. ata, scsi, usb); empty if udev sets none, as for NVMe disks.
 	Bus string `json:"bus,omitempty"`
 	// Model identifier reported by hardware or udev.
 	Model string `json:"model,omitempty"`
@@ -180,7 +180,7 @@ type PhysicalDiskStatus struct {
 	// Conditions represents the latest available observations of a disk's state.
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
-	// Info contains static and udev-reported hardware metadata.
+	// Info contains static hardware metadata from sysfs and the udev database.
 	Info DiskInfo `json:"info,omitempty"`
 
 	// Telemetry contains the latest observed operational snapshot of the disk.

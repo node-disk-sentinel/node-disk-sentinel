@@ -118,7 +118,8 @@ privileged Kubernetes permissions. Treat all host-facing input as untrusted.
 - Do not invoke a shell to run `smartctl` or other commands. Pass arguments
   directly to process execution APIs.
 - Do not wake standby disks unless the feature explicitly requires it.
-- Keep uevent handling bounded and validate event data before acting on it.
+- Treat uevents as hints only: never change state from event data, rescan the
+  authoritative sources (sysfs, udev database) instead.
 - Apply least privilege to RBAC, mounts, capabilities, and network access.
 - Do not add credentials, kubeconfigs, disk serial numbers, or other sensitive
   cluster data to commits, fixtures, logs, or pull request descriptions.

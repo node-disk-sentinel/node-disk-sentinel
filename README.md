@@ -9,13 +9,15 @@ Continuous SMART assessment for every node disk, with Kubernetes resources and P
 
 - A single daemon binary runs on each node; no `smartd` daemon or separate
   controller process is required.
-- The monitor reads udev's runtime database directly from `/run/udev/data` and
-  uses stable device paths where available. It operates on a strict 1:1 mapping
-  between discovered host block devices (`/dev/sd*`, `/dev/nvme*n*`) and
-  cluster-scoped `PhysicalDisk` resources.
+- The monitor lists whole disks from `/sys/block` and reads udev's runtime
+  database from `/run/udev/data` for their identity and stable device paths. It
+  operates on a strict 1:1 mapping between discovered host block devices
+  (`/dev/sd*`, `/dev/nvme*n*`) and cluster-scoped `PhysicalDisk` resources.
 - It polls disks every 10 minutes by default and listens for udev-processed
-  Netlink add, change, online, remove, and offline events. Add/change bursts
-  are coalesced before a full inventory refresh.
+  Netlink events. Adding or removing a disk triggers an inventory refresh;
+  bursts of events are coalesced. Events are only a hint: the refresh always
+  re-reads sysfs and the udev database, and it also runs whenever the listener
+  (re)connects, so no change is missed.
 - `hostNetwork: true` is required so the monitor can receive host udev Netlink
   broadcasts. The DaemonSet also mounts the host `/dev`, `/run/udev/data`, and
   `/sys` paths and runs privileged to invoke `smartctl` against host devices.
@@ -40,10 +42,10 @@ Drive health is assessed using a deterministic, prioritized multi-protocol sever
 
 1. **ATA Disks** (incorporating tiered severity concepts inspired by `libatasmart`):
    - `SelfAssessmentFailed`: Drive overall-health test failed (`smart_status.passed == false` or smartctl exit bit 3).
-   - `ExcessiveSectorErrors`: Reallocated (ATA 5) or pending (ATA 197) sectors breached manufacturer threshold (`when_failed == "failing_now"`).
-   - `AttributeFailingNow`: Any other pre-failure attribute currently failing its manufacturer threshold.
+   - `ExcessiveSectorErrors`: Reallocated (ATA 5) or pending (ATA 197) sectors breached manufacturer threshold (`when_failed == "now"`).
+   - `AttributeFailingNow`: Any other attribute currently at or below its manufacturer threshold (`when_failed == "now"`, or smartctl exit bit 4 for a pre-failure attribute).
    - `SectorErrors`: Bad sectors exist in raw count (ATA 5 or ATA 197 `> 0`), but normalized attributes have not breached threshold.
-   - `AttributeFailedInPast`: An attribute previously dropped below threshold in the past (`when_failed == "in_the_past"`).
+   - `AttributeFailedInPast`: An attribute previously dropped below threshold in the past (`when_failed == "past"`).
    - `Good`: All attributes within design parameters and zero sector errors observed.
 
 2. **NVMe Drives** (derived from the NVM Express Base Specification, SMART / Health Information Log):
@@ -69,13 +71,13 @@ The resource reports two conditions:
 
 `status.info.rotational` indicates whether the medium is rotational (HDD: `true`, SSD/NVMe: `false`).
 
-`status.info.canonicalPath` stores the kernel device path reported by udev (for
-example, `/dev/sda` or `/dev/nvme0n1`). `status.info.path` remains the preferred
+`status.info.canonicalPath` stores the kernel device path (for example,
+`/dev/sda` or `/dev/nvme0n1`). `status.info.path` remains the preferred
 persistent path used by the collector.
 
 `status.telemetry` captures a compact operational snapshot from the last
 successful collection (`temperatureCelsius`, `powerOnHours`, `powerCycleCount`,
-ATA sector counts, NVMe percentage used, available spare, and media errors).
+ATA sector counts, NVMe percentage used, available spare, critical warning, and media errors).
 A failed collection preserves the previous telemetry snapshot.
 
 A failed collection describes the collection, not the hardware. The last known
@@ -109,8 +111,8 @@ and community Grafana dashboards (such as dashboard `22604`):
 - `smartctl_device_health_status`: Evaluated disk health status gauge (`Good`, `SectorErrors`, etc.).
 - `smartctl_device_collection_success`: Last SMART data collection result (`1` = success, `0` = failure).
 
-Every metric includes `node`, `disk`, and `device` labels alongside standard `smartctl_exporter` labels. All readings of a
-detached disk are automatically pruned to prevent stale metric export.
+Every metric except `smartctl_version` includes `node`, `disk`, and `device` labels alongside standard `smartctl_exporter` labels
+(`smartctl_version` carries only `node`). All readings of a detached disk are automatically pruned to prevent stale metric export.
 
 Prometheus metrics export can be disabled via the `--metrics-enabled=false` flag (or `metrics.enabled: false` in Helm). When disabled, the HTTP server continues serving `/healthz` and `/readyz` for health and readiness probes while returning 404 for `/metrics`.
 
@@ -234,7 +236,7 @@ discovery:
     - "node=worker-03,serial=ABC123"
 ```
 
-Each rule is a comma-separated string of exact matches (`node`, `name`, `vendor`, `model`, `serial`, `wwn`, `bus`). `node` is optional and limits the rule to that Kubernetes Node; all supplied fields must match. Excluded devices are neither probed nor published as `PhysicalDisk` resources, and any matching existing resources are automatically removed. See the [FAQ](FAQ.md) for more examples.
+Each rule is a comma-separated string of exact matches (`node`, `name`, `vendor`, `model`, `serial`, `wwn`, `bus`; `wwn` is compared case-insensitively). `node` is optional and limits the rule to that Kubernetes Node; all supplied fields must match. Excluded devices are neither probed nor published as `PhysicalDisk` resources, and any matching existing resources are automatically removed. See the [FAQ](FAQ.md) for more examples.
 
 ### Upgrade And Uninstall
 
@@ -298,7 +300,7 @@ development builds use Git's describe format, for example
 and container image:
 
 ```sh
-make package
+make build package
 ./bin/node-disk-sentinel --version
 ```
 

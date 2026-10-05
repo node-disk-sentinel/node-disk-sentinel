@@ -46,9 +46,9 @@ make cluster-down
 
 ## Hot-Plugging / Syncing Devices in Kind
 
-In production environments (bare metal or virtual machines running directly as Kubernetes nodes), `node-disk-sentinel` accesses the host's `/dev` via a `hostPath` volume mount. When disks are plugged in or unplugged, the Linux kernel creates or removes device nodes (`/dev/sd*`, `/dev/nvme*n*`) directly in the host's `/dev`, and the daemonset automatically detects them via udev/kernel netlink events.
+In production environments (bare metal or virtual machines running directly as Kubernetes nodes), `node-disk-sentinel` accesses the host's `/dev` via a `hostPath` volume mount. When disks are plugged in or unplugged, the Linux kernel creates or removes device nodes (`/dev/sd*`, `/dev/nvme*n*`) directly in the host's `/dev`, and the daemonset automatically detects them via udev's netlink events.
 
-**In this Kind test setup**, however, the Kubernetes node itself runs inside a Docker container (`nds-dev-control-plane`) with an isolated private `/dev` tmpfs (mounting the host's root `/dev` directly is not possible as it would break container systemd/cgroups). While host udev metadata (`/run/udev/data`) and symlinks (`/dev/disk`) are bind-mounted, **newly connected physical block devices (such as USB drives) do not automatically create device nodes inside the Kind container**.
+**In this Kind test setup**, however, the Kubernetes node itself runs inside a Docker container (`nds-dev-control-plane`) with an isolated private `/dev` tmpfs (mounting the host's root `/dev` directly is not possible as it would break container systemd/cgroups). While host udev metadata (`/run/udev/data`) and symlinks (`/dev/disk`) are bind-mounted, **newly connected physical block devices (such as USB drives) do not automatically create device nodes inside the Kind container**. The Kind node also has its own network namespace, so the host's udev events never reach the daemonset there; changes are only noticed by the periodic scan or after `make sync-devices`.
 
 If you attach or detach a drive while the Kind cluster is already running, run:
 
