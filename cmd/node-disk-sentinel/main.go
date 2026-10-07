@@ -64,9 +64,9 @@ func (o *options) bindFlags() {
 	// In the DaemonSet container, the host's /run/udev/data is mounted here read-only.
 	flag.StringVar(&o.udevDataDir, "udev-data-dir", "/run/udev/data", "Path to host udev database directory")
 	flag.DurationVar(&o.pollInterval, "poll-interval", 10*time.Minute, "Interval between SMART and disk discovery polling cycles")
-	// eventDebounce buffers rapid cascades of udev events (e.g. partition creation, rule execution)
-	// so the daemon reconciles only once after the device activity settles.
-	flag.DurationVar(&o.eventDebounce, "event-debounce", time.Second, "Quiet period before reconciling a burst of udev add/change events")
+	// eventDebounce lets disks that appear together (boot, HBA or enclosure
+	// hot-plug) share a single reconcile.
+	flag.DurationVar(&o.eventDebounce, "event-debounce", time.Second, "Delay after the first udev add/remove event, so that a burst of events causes one reconcile")
 	flag.DurationVar(&o.smartctlTimeout, "smartctl-timeout", 30*time.Second, "Timeout for each smartctl command execution")
 	flag.Func("exclude-disk", "Exclude disks matching comma-separated exact key=value pairs (node, name, vendor, model, serial, wwn, bus); may be repeated", func(value string) error {
 		o.excludeDisks = append(o.excludeDisks, value)
@@ -242,7 +242,7 @@ func run(opts *options) error {
 		return fmt.Errorf("failed to setup PhysicalDisk reconciler: %w", err)
 	}
 
-	// Register DiskMonitor as Runnable for local udev listener and periodic hardware scans.
+	// Register DiskMonitor as Runnable for the local udev monitor and periodic hardware scans.
 	if err := mgr.Add(monitor); err != nil {
 		return fmt.Errorf("failed to add DiskMonitor runnable: %w", err)
 	}

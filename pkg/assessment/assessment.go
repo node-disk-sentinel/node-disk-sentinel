@@ -97,9 +97,9 @@ func Evaluate(smartData *smartmontools.SmartctlOutput) AssessmentResult {
 		}
 	}
 
-	// Level 2: ExcessiveSectorErrors (reallocated or pending sector threshold breached)
-	// Follows libatasmart (SK_SMART_OVERALL_BAD_SECTOR_MANY):
-	// when reallocated or pending sector count breaches manufacturer threshold.
+	// Level 2: ExcessiveSectorErrors (reallocated or pending sector threshold breached).
+	// Ranks like libatasmart's SK_SMART_OVERALL_BAD_SECTOR_MANY, but is decided by
+	// the manufacturer threshold of attributes 5 and 197 instead of a sector count.
 	if hasSectorFailingNow {
 		findings = append([]v1alpha1.Finding{{
 			ID:            "EXCESSIVE_SECTOR_ERRORS",

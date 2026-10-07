@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -91,6 +92,10 @@ func failingATADisk() *smartmontools.SmartctlOutput {
 func newTestMonitor(t *testing.T, runner smartmontools.Runner) (*DiskMonitor, client.Client, *record.FakeRecorder) {
 	t.Helper()
 
+	// The metrics are process-wide, so series of earlier tests (or earlier runs
+	// with -count) would show up in the assertions about them.
+	metrics.CollectionSuccess.Reset()
+
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatalf("failed to register core scheme: %v", err)
@@ -107,31 +112,57 @@ func newTestMonitor(t *testing.T, runner smartmontools.Runner) (*DiskMonitor, cl
 		WithStatusSubresource(&v1alpha1.PhysicalDisk{}).
 		Build()
 
-	udevDir := t.TempDir()
-	udevRecord := `S:disk/by-id/ata-WDC_WD10EZEX-08WN4A0
-S:disk/by-id/wwn-0x50014ee265882b7f
-E:DEVNAME=/dev/sda
-E:DEVTYPE=disk
-E:ID_BUS=ata
-E:ID_MODEL=WDC_WD10EZEX-08WN4A0
-E:ID_SERIAL=WDC_WD10EZEX-08WN4A0_WD-WCC6Y7PL7345
-E:ID_WWN=0x50014ee265882b7f
-E:MAJOR=8
-E:MINOR=0
-`
-	if err := os.WriteFile(filepath.Join(udevDir, "b8:0"), []byte(udevRecord), 0o644); err != nil {
-		t.Fatalf("failed to write udev record: %v", err)
-	}
+	sysDir, udevDir := writeTestHost(t)
 
 	recorder := record.NewFakeRecorder(16)
 	monitor := NewDiskMonitor(fakeClient, recorder, runner, MonitorOptions{
-		NodeName:     testNodeName,
-		UdevDataDir:  udevDir,
-		PollInterval: 10 * time.Minute,
+		NodeName:      testNodeName,
+		SysDir:        sysDir,
+		UdevDataDir:   udevDir,
+		PollInterval:  10 * time.Minute,
+		EventDebounce: 10 * time.Millisecond,
 	})
-	monitor.nodeRef = node
+	monitor.nodeRef.Store(node)
 
 	return monitor, fakeClient, recorder
+}
+
+// writeTestHost creates a sysfs tree and a udev database describing a single
+// ATA disk, /dev/sda, and returns their directories.
+func writeTestHost(t *testing.T) (sysDir, udevDir string) {
+	t.Helper()
+	sysDir, udevDir = t.TempDir(), t.TempDir()
+	addTestDisk(t, sysDir, udevDir, "sda", "8:0", "0x50014ee265882b7f")
+	return sysDir, udevDir
+}
+
+// addTestDisk adds an ATA disk with the given kernel name, device number and WWN
+// to a sysfs tree and udev database.
+func addTestDisk(t *testing.T, sysDir, udevDir, name, majorMinor, wwn string) {
+	t.Helper()
+
+	kobject := filepath.Join(sysDir, "devices", "pci0000:00", "block", name)
+	for _, dir := range []string{kobject, filepath.Join(sysDir, "block")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(kobject, "dev"), []byte(majorMinor+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("..", "devices", "pci0000:00", "block", name), filepath.Join(sysDir, "block", name)); err != nil {
+		t.Fatal(err)
+	}
+
+	udevRecord := "S:disk/by-id/ata-TEST_DISK_" + name + "\n" +
+		"S:disk/by-id/wwn-" + wwn + "\n" +
+		"E:ID_BUS=ata\n" +
+		"E:ID_MODEL=TEST_DISK\n" +
+		"E:ID_SERIAL=TEST_DISK_" + name + "\n" +
+		"E:ID_WWN=" + wwn + "\n"
+	if err := os.WriteFile(filepath.Join(udevDir, "b"+majorMinor), []byte(udevRecord), 0o644); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func singleDisk(t *testing.T, c client.Client) v1alpha1.PhysicalDisk {
@@ -370,32 +401,6 @@ func TestEventsAreOnlyEmittedOnStateChange(t *testing.T) {
 	}
 }
 
-func TestHandleDeviceRemovalMarksDiskMissing(t *testing.T) {
-	monitor, c, _ := newTestMonitor(t, &mockSmartctlRunner{output: healthyATADisk()})
-	ctx := context.Background()
-
-	if err := monitor.ReconcileAll(ctx); err != nil {
-		t.Fatalf("ReconcileAll failed: %v", err)
-	}
-
-	monitor.handleDeviceRemoval(ctx, &discovery.UEvent{
-		Action:    discovery.ActionRemove,
-		Subsystem: "block",
-		DevName:   "/dev/sda",
-		DevPath:   "/devices/pci0000:00/0000:00:1f.2/ata1/host0/target0:0:0/0:0:0:0/block/sda",
-		DevType:   "disk",
-	})
-
-	disk := singleDisk(t, c)
-	collected := meta.FindStatusCondition(disk.Status.Conditions, v1alpha1.ConditionDataCollected)
-	if collected == nil || collected.Status != metav1.ConditionFalse {
-		t.Fatalf("unexpected DataCollected condition: %#v", collected)
-	}
-	if collected.Reason != v1alpha1.ReasonDiskMissing {
-		t.Errorf("reason = %q; want %q", collected.Reason, v1alpha1.ReasonDiskMissing)
-	}
-}
-
 func TestReconcileAllMarksAbsentDiskMissing(t *testing.T) {
 	monitor, c, _ := newTestMonitor(t, &mockSmartctlRunner{output: healthyATADisk()})
 	ctx := context.Background()
@@ -404,8 +409,9 @@ func TestReconcileAllMarksAbsentDiskMissing(t *testing.T) {
 		t.Fatalf("initial ReconcileAll failed: %v", err)
 	}
 
-	if err := os.Remove(filepath.Join(monitor.Options.UdevDataDir, "b8:0")); err != nil {
-		t.Fatalf("failed to remove udev record: %v", err)
+	// The kernel removes the sysfs entry before udev deletes its record.
+	if err := os.Remove(filepath.Join(monitor.Options.SysDir, "block", "sda")); err != nil {
+		t.Fatalf("failed to remove sysfs entry: %v", err)
 	}
 
 	if err := monitor.ReconcileAll(ctx); err != nil {
@@ -419,8 +425,87 @@ func TestReconcileAllMarksAbsentDiskMissing(t *testing.T) {
 	}
 }
 
+// If the udev database is unavailable (for example an empty hostPath directory),
+// the disks must be kept as they are instead of being flagged as missing.
+func TestReconcileAllKeepsDisksWhenUdevDatabaseIsUnavailable(t *testing.T) {
+	monitor, c, _ := newTestMonitor(t, &mockSmartctlRunner{output: healthyATADisk()})
+	ctx := context.Background()
+
+	if err := monitor.ReconcileAll(ctx); err != nil {
+		t.Fatalf("initial ReconcileAll failed: %v", err)
+	}
+	if err := os.Remove(filepath.Join(monitor.Options.UdevDataDir, "b8:0")); err != nil {
+		t.Fatalf("failed to remove udev record: %v", err)
+	}
+
+	if err := monitor.ReconcileAll(ctx); err == nil {
+		t.Error("ReconcileAll succeeded without a udev database; want an error")
+	}
+
+	collected := meta.FindStatusCondition(singleDisk(t, c).Status.Conditions, v1alpha1.ConditionDataCollected)
+	if collected == nil || collected.Status != metav1.ConditionTrue {
+		t.Errorf("disk was touched although udev data is unavailable: %#v", collected)
+	}
+}
+
+// countingRunner counts Collect calls. If gate is set, Collect reports its entry
+// on entered and then waits until gate is closed.
+type countingRunner struct {
+	output  *smartmontools.SmartctlOutput
+	calls   atomic.Int32
+	gate    chan struct{}
+	entered chan struct{}
+}
+
+func (r *countingRunner) Collect(context.Context, string, string) (*smartmontools.SmartctlOutput, error) {
+	r.calls.Add(1)
+	if r.gate != nil {
+		r.entered <- struct{}{}
+		<-r.gate
+	}
+	return r.output, nil
+}
+
+func eventually(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// startMonitor runs monitor.Start and stops it when the test ends.
+func startMonitor(t *testing.T, monitor *DiskMonitor) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = monitor.Start(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+}
+
+// watchWith returns a watch function that, like a freshly bound udev socket,
+// triggers once and then hands its trigger to the test.
+func watchWith(triggers chan<- func()) func(context.Context, func()) error {
+	return func(ctx context.Context, trigger func()) error {
+		trigger()
+		triggers <- trigger
+		<-ctx.Done()
+		return nil
+	}
+}
+
 func TestDiskMonitorStartSetsReady(t *testing.T) {
 	monitor, _, _ := newTestMonitor(t, &mockSmartctlRunner{output: healthyATADisk()})
+	monitor.watch = watchWith(make(chan func(), 1))
 	if monitor.Ready() {
 		t.Fatal("expected monitor.Ready() to be false initially")
 	}
@@ -432,20 +517,99 @@ func TestDiskMonitorStartSetsReady(t *testing.T) {
 		_ = monitor.Start(ctx)
 	}()
 
-	for i := 0; i < 50; i++ {
-		if monitor.Ready() {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if !monitor.Ready() {
-		t.Error("expected monitor.Ready() to become true after Start initial scan")
-	}
+	eventually(t, "the initial scan", monitor.Ready)
 
 	cancel()
 	<-startDone
 	if monitor.Ready() {
 		t.Error("expected monitor.Ready() to be false after Start returns")
+	}
+}
+
+// The start-up scan and the trigger a monitor emits right after binding its
+// socket belong to the same delay window and must cost a single scan.
+func TestStartScansOnceForStartupTriggers(t *testing.T) {
+	runner := &countingRunner{output: healthyATADisk()}
+	monitor, _, _ := newTestMonitor(t, runner)
+	monitor.watch = watchWith(make(chan func(), 1))
+
+	startMonitor(t, monitor)
+	eventually(t, "the initial scan", monitor.Ready)
+	time.Sleep(100 * time.Millisecond)
+
+	if got := runner.calls.Load(); got != 1 {
+		t.Errorf("got %d scans at start-up; want 1", got)
+	}
+}
+
+func TestStartCoalescesBurstOfTriggersIntoOneScan(t *testing.T) {
+	runner := &countingRunner{output: healthyATADisk()}
+	monitor, _, _ := newTestMonitor(t, runner)
+	monitor.Options.EventDebounce = 100 * time.Millisecond
+	triggers := make(chan func(), 1)
+	monitor.watch = watchWith(triggers)
+
+	startMonitor(t, monitor)
+	eventually(t, "the initial scan", monitor.Ready)
+	trigger := <-triggers
+	before := runner.calls.Load()
+
+	for i := 0; i < 20; i++ {
+		trigger()
+	}
+	eventually(t, "the scan for the burst", func() bool { return runner.calls.Load() > before })
+	time.Sleep(300 * time.Millisecond)
+
+	if got := runner.calls.Load() - before; got != 1 {
+		t.Errorf("a burst of 20 triggers caused %d scans; want 1", got)
+	}
+}
+
+// If the monitor cannot run at all, for example because socket creation is
+// blocked, the periodic scan must keep working.
+func TestStartKeepsPollingWhenMonitorFails(t *testing.T) {
+	runner := &countingRunner{output: healthyATADisk()}
+	monitor, _, _ := newTestMonitor(t, runner)
+	monitor.Options.PollInterval = 20 * time.Millisecond
+	monitor.watch = func(context.Context, func()) error { return errors.New("netlink unavailable") }
+
+	startMonitor(t, monitor)
+	eventually(t, "periodic scans", func() bool { return runner.calls.Load() >= 3 })
+}
+
+// A removal must be recorded before the slow smartctl runs of the remaining
+// disks, not after them.
+func TestReconcileAllMarksRemovedDiskMissingBeforeCollecting(t *testing.T) {
+	runner := &countingRunner{output: healthyATADisk()}
+	monitor, c, _ := newTestMonitor(t, runner)
+	addTestDisk(t, monitor.Options.SysDir, monitor.Options.UdevDataDir, "sdb", "8:16", "0x50014ee265882b80")
+	ctx := context.Background()
+
+	if err := monitor.ReconcileAll(ctx); err != nil {
+		t.Fatalf("initial ReconcileAll failed: %v", err)
+	}
+
+	// sda is unplugged; sdb stays and its collection is held up.
+	if err := os.Remove(filepath.Join(monitor.Options.SysDir, "block", "sda")); err != nil {
+		t.Fatal(err)
+	}
+	runner.gate, runner.entered = make(chan struct{}), make(chan struct{}, 1)
+
+	done := make(chan error, 1)
+	go func() { done <- monitor.ReconcileAll(ctx) }()
+
+	<-runner.entered
+	var removed v1alpha1.PhysicalDisk
+	if err := c.Get(ctx, client.ObjectKey{Name: testNodeName + "-0x50014ee265882b7f"}, &removed); err != nil {
+		t.Fatalf("failed to get the removed disk: %v", err)
+	}
+	if cond := meta.FindStatusCondition(removed.Status.Conditions, v1alpha1.ConditionDataCollected); cond == nil || cond.Reason != v1alpha1.ReasonDiskMissing {
+		t.Errorf("removed disk is not marked missing while smartctl still runs: %#v", cond)
+	}
+
+	close(runner.gate)
+	if err := <-done; err != nil {
+		t.Fatalf("ReconcileAll failed: %v", err)
 	}
 }
 
@@ -588,21 +752,7 @@ func TestReconcileTriggeredOnSpecChange(t *testing.T) {
 		WithStatusSubresource(&v1alpha1.PhysicalDisk{}).
 		Build()
 
-	udevDir := t.TempDir()
-	udevRecord := `S:disk/by-id/ata-WDC_WD10EZEX-08WN4A0
-S:disk/by-id/wwn-0x50014ee265882b7f
-E:DEVNAME=/dev/sda
-E:DEVTYPE=disk
-E:ID_BUS=ata
-E:ID_MODEL=WDC_WD10EZEX-08WN4A0
-E:ID_SERIAL=WDC_WD10EZEX-08WN4A0_WD-WCC6Y7PL7345
-E:ID_WWN=0x50014ee265882b7f
-E:MAJOR=8
-E:MINOR=0
-`
-	if err := os.WriteFile(filepath.Join(udevDir, "b8:0"), []byte(udevRecord), 0o644); err != nil {
-		t.Fatalf("failed to write udev record: %v", err)
-	}
+	sysDir, udevDir := writeTestHost(t)
 
 	var capturedArgs string
 	runner := &argCapturingRunner{
@@ -613,6 +763,7 @@ E:MINOR=0
 
 	monitor := NewDiskMonitor(fakeClient, record.NewFakeRecorder(10), runner, MonitorOptions{
 		NodeName:    testNodeName,
+		SysDir:      sysDir,
 		UdevDataDir: udevDir,
 	})
 

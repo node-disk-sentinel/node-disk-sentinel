@@ -12,40 +12,34 @@ import (
 	"github.com/votdev/node-disk-sentinel/pkg/apis/node-disk-sentinel.org/v1alpha1"
 )
 
-func TestShouldIgnoreDevice(t *testing.T) {
+func TestShouldIgnoreByName(t *testing.T) {
 	tests := []struct {
 		name     string
-		devName  string
-		devType  string
 		expected bool
 	}{
-		{"disk sda", "sda", "disk", false},
-		{"disk nvme0n1", "nvme0n1", "disk", false},
-		{"loop device", "loop0", "disk", true},
-		{"ram device", "ram1", "disk", true},
-		{"zram device", "zram0", "disk", true},
-		{"dm device", "dm-0", "disk", true},
-		{"md device", "md0", "disk", true},
-		{"partition type", "sda1", "partition", true},
-		{"sda1 without type", "sda1", "", true},
-		{"nvme0n1p1 without type", "nvme0n1p1", "", true},
-		{"cdrom sr0", "sr0", "disk", true},
-		{"empty type sda", "sda", "", false},
-		{"ceph rbd device", "rbd0", "disk", true},
-		{"drbd device", "drbd1", "disk", true},
+		{"sda", false},
+		{"nvme0n1", false},
+		{"vda", false},
+		{"mmcblk0", false},
+		{"loop0", true},
+		{"ram1", true},
+		{"zram0", true},
+		{"dm-0", true},
+		{"md0", true},
+		{"sr0", true},
+		{"rbd0", true},
+		{"drbd1", true},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := ShouldIgnoreDevice(tt.devName, tt.devType)
-			if got != tt.expected {
-				t.Errorf("ShouldIgnoreDevice(%q, %q) = %v; want %v", tt.devName, tt.devType, got, tt.expected)
+			if got := ShouldIgnore(tt.name, nil); got != tt.expected {
+				t.Errorf("ShouldIgnore(%q) = %v; want %v", tt.name, got, tt.expected)
 			}
 		})
 	}
 }
 
-func TestShouldIgnoreProperties(t *testing.T) {
+func TestShouldIgnoreByProperties(t *testing.T) {
 	tests := []struct {
 		name     string
 		props    map[string]string
@@ -154,57 +148,9 @@ func TestShouldIgnoreProperties(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := ShouldIgnoreProperties(tt.props)
+			got := ShouldIgnore("sda", tt.props)
 			if got != tt.expected {
-				t.Errorf("ShouldIgnoreProperties() = %v; want %v", got, tt.expected)
-			}
-		})
-	}
-}
-
-func TestShouldIgnore(t *testing.T) {
-	tests := []struct {
-		name     string
-		devName  string
-		devType  string
-		props    map[string]string
-		expected bool
-	}{
-		{
-			name:     "physical disk valid properties",
-			devName:  "sda",
-			devType:  "disk",
-			props:    map[string]string{"ID_BUS": "ata"},
-			expected: false,
-		},
-		{
-			name:     "ignored device prefix",
-			devName:  "loop0",
-			devType:  "disk",
-			props:    map[string]string{"ID_BUS": "ata"},
-			expected: true,
-		},
-		{
-			name:     "ignored properties iscsi",
-			devName:  "sda",
-			devType:  "disk",
-			props:    map[string]string{"ID_BUS": "iscsi"},
-			expected: true,
-		},
-		{
-			name:     "partition type",
-			devName:  "sda1",
-			devType:  "partition",
-			props:    nil,
-			expected: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := ShouldIgnore(tt.devName, tt.devType, tt.props)
-			if got != tt.expected {
-				t.Errorf("ShouldIgnore(%q, %q, %v) = %v; want %v", tt.devName, tt.devType, tt.props, got, tt.expected)
+				t.Errorf("ShouldIgnore() = %v; want %v", got, tt.expected)
 			}
 		})
 	}
@@ -273,37 +219,6 @@ func TestParseExcludeRuleRejectsInvalidInput(t *testing.T) {
 		if _, err := ParseExcludeRule(value); err == nil {
 			t.Errorf("ParseExcludeRule(%q) error = nil; want error", value)
 		}
-	}
-}
-
-func TestDiscoverDisksFiltersDynamicStorageVolumes(t *testing.T) {
-	tmpDir := t.TempDir()
-	longhornRecord := `E:DEVNAME=/dev/sda
-E:DEVTYPE=disk
-E:ID_BUS=scsi
-E:ID_VENDOR=IET
-E:ID_MODEL=VIRTUAL-DISK
-E:ID_PATH=ip-10.52.0.59:3260-iscsi-iqn.2019-10.io.longhorn:pvc-697ac77e-8c65-43ad-aa11-55023ac835d8-lun-1
-E:DEVPATH=/devices/platform/host2/session1/target2:0:0/2:0:0:1/block/sda
-`
-	virtioRecord := `E:DEVNAME=/dev/vda
-E:DEVTYPE=disk
-E:ID_PATH=pci-0000:00:04.0
-E:DEVPATH=/devices/pci0000:00/0000:00:04.0/virtio1/block/vda
-`
-	if err := os.WriteFile(filepath.Join(tmpDir, "b8:0"), []byte(longhornRecord), 0o644); err != nil {
-		t.Fatalf("failed to write Longhorn udev record: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(tmpDir, "b253:0"), []byte(virtioRecord), 0o644); err != nil {
-		t.Fatalf("failed to write VirtIO udev record: %v", err)
-	}
-
-	disks, err := DiscoverDisks(tmpDir, "worker-01")
-	if err != nil {
-		t.Fatalf("DiscoverDisks failed: %v", err)
-	}
-	if len(disks) != 1 || disks[0].Name != "vda" {
-		t.Fatalf("DiscoverDisks() = %#v; want only VirtIO disk vda", disks)
 	}
 }
 
@@ -473,146 +388,264 @@ func TestGenerateCRName(t *testing.T) {
 }
 
 func TestParseUdevDataFile(t *testing.T) {
-	tmpDir := t.TempDir()
-	content := `S:disk/by-id/ata-WDC_WD10EZEX-08WN4A0_WD-WCC6Y7PL7345
-S:disk/by-id/wwn-0x50014ee265882b7f
-S:disk/by-path/pci-0000:00:1f.2-ata-1
-E:DEVNAME=/dev/sda
-E:DEVTYPE=disk
-E:ID_BUS=ata
-E:ID_MODEL=WDC_WD10EZEX-08WN4A0
-E:ID_SERIAL=WDC_WD10EZEX-08WN4A0_WD-WCC6Y7PL7345
-E:ID_SERIAL_SHORT=WD-WCC6Y7PL7345
-E:ID_WWN=0x50014ee265882b7f
-E:MAJOR=8
-E:MINOR=0
-`
-	filePath := filepath.Join(tmpDir, "b8:0")
-	if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
+	filePath := filepath.Join(t.TempDir(), "b8:0")
+	content := "\n\nx\n" + // short lines are skipped
+		"S:disk/by-id/ata-WDC_WD10EZEX-08WN4A0_WD-WCC6Y7PL7345\n" +
+		"S:disk/by-id/wwn-0x50014ee265882b7f\n" +
+		"E:ID_MODEL=WDC_WD10EZEX-08WN4A0\n" +
+		"E:ID_WWN=0x50014ee265882b7f\n" +
+		"E:NO_EQUALS_HERE\n" +
+		"G:systemd\nQ:systemd\nV:1\n"
+	if err := os.WriteFile(filePath, []byte(content), 0o644); err != nil {
 		t.Fatalf("failed to write test file: %v", err)
 	}
 
-	udevRecord, err := ParseUdevDataFile(filePath)
+	record, err := ParseUdevDataFile(filePath)
 	if err != nil {
 		t.Fatalf("ParseUdevDataFile failed: %v", err)
 	}
+	if len(record.Symlinks) != 2 || record.Symlinks[1] != "disk/by-id/wwn-0x50014ee265882b7f" {
+		t.Errorf("Symlinks = %v; want 2 entries relative to /dev", record.Symlinks)
+	}
+	if record.Properties["ID_WWN"] != "0x50014ee265882b7f" || record.Properties["ID_MODEL"] != "WDC_WD10EZEX-08WN4A0" {
+		t.Errorf("Properties = %v", record.Properties)
+	}
+	if len(record.Properties) != 2 {
+		t.Errorf("got %d properties; want 2 (malformed and non-E lines ignored)", len(record.Properties))
+	}
 
-	if udevRecord.Major != 8 || udevRecord.Minor != 0 {
-		t.Errorf("Major/Minor = %d:%d; want 8:0", udevRecord.Major, udevRecord.Minor)
-	}
-	if len(udevRecord.Symlinks) != 3 {
-		t.Errorf("got %d symlinks; want 3", len(udevRecord.Symlinks))
-	}
-	if udevRecord.Properties["ID_WWN"] != "0x50014ee265882b7f" {
-		t.Errorf("ID_WWN = %s; want 0x50014ee265882b7f", udevRecord.Properties["ID_WWN"])
+	if _, err := ParseUdevDataFile(filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Error("expected an error for a missing file")
 	}
 }
 
-func TestDiscoverDisks_ParsesRotational(t *testing.T) {
-	tmpDir := t.TempDir()
-	content := `E:DEVNAME=/dev/sdb
-E:DEVTYPE=disk
+// fakeHost builds a sysfs tree and a udev database in temporary directories.
+type fakeHost struct {
+	t            *testing.T
+	sysDir, udev string
+}
+
+func newFakeHost(t *testing.T) *fakeHost {
+	t.Helper()
+	h := &fakeHost{t: t, sysDir: t.TempDir(), udev: t.TempDir()}
+	if err := os.MkdirAll(filepath.Join(h.sysDir, "block"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return h
+}
+
+func (h *fakeHost) write(path, content string) {
+	h.t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		h.t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+// addDisk creates /sys/block/<name> (a symlink into /sys/devices, like the
+// kernel does) with the given sysfs attributes and, if record is not empty, the
+// udev record for majorMinor.
+func (h *fakeHost) addDisk(name, majorMinor, record string, attrs map[string]string) {
+	h.t.Helper()
+	kobject := filepath.Join(h.sysDir, "devices", "pci0000:00", "block", name)
+	h.write(filepath.Join(kobject, "dev"), majorMinor+"\n")
+	for file, value := range attrs {
+		h.write(filepath.Join(kobject, file), value)
+	}
+	if err := os.Symlink(filepath.Join("..", "devices", "pci0000:00", "block", name), filepath.Join(h.sysDir, "block", name)); err != nil {
+		h.t.Fatal(err)
+	}
+	if record != "" {
+		h.write(filepath.Join(h.udev, "b"+majorMinor), record)
+	}
+}
+
+func (h *fakeHost) discover(rules ...ExcludeRule) []v1alpha1.DiskInfo {
+	h.t.Helper()
+	disks, err := DiscoverDisks(h.sysDir, h.udev, "worker-01", rules...)
+	if err != nil {
+		h.t.Fatalf("DiscoverDisks failed: %v", err)
+	}
+	return disks
+}
+
+const sataRecord = `S:disk/by-path/pci-0000:00:1f.2-ata-1
+S:disk/by-id/wwn-0x500253855031cfa5
 E:ID_BUS=ata
-E:ID_MODEL=TEST_MODEL
-E:ID_SERIAL=TEST_SERIAL
+E:ID_MODEL=Samsung_SSD_840_PRO_Series
+E:ID_SERIAL=Samsung_SSD_840_PRO_Series_S1ATNEAD511307R
+E:ID_SERIAL_SHORT=S1ATNEAD511307R
+E:ID_WWN=0x500253855031cfa5
+E:ID_PATH=pci-0000:00:1f.2-ata-1
+E:ID_REVISION=DXM06B0Q
 `
-	if err := os.WriteFile(filepath.Join(tmpDir, "b8:16"), []byte(content), 0644); err != nil {
-		t.Fatalf("failed to write test file: %v", err)
-	}
 
-	devices, err := DiscoverDisks(tmpDir, "worker-01")
-	if err != nil {
-		t.Fatalf("DiscoverDisks failed: %v", err)
-	}
-	if len(devices) != 1 {
-		t.Fatalf("expected 1 device, got %d", len(devices))
-	}
-	if devices[0].Name != "sdb" {
-		t.Errorf("Name = %s; want sdb", devices[0].Name)
-	}
-	if devices[0].CanonicalPath != "/dev/sdb" {
-		t.Errorf("CanonicalPath = %q; want /dev/sdb", devices[0].CanonicalPath)
-	}
-	// On systems without /sys/class/block/sdb/queue/rotational, Rotational should be nil
-	// which is expected and handled gracefully.
-}
+func TestDiscoverDisks(t *testing.T) {
+	h := newFakeHost(t)
+	h.addDisk("sda", "8:0", sataRecord, map[string]string{"size": "1000\n", "queue/rotational": "0\n"})
 
-func TestDiscoverDisks_InvalidAndEmpty(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	// Empty dir returns empty list without error.
-	devices, err := DiscoverDisks(tmpDir, "worker-01")
-	if err != nil {
-		t.Fatalf("DiscoverDisks failed on empty dir: %v", err)
+	disks := h.discover()
+	if len(disks) != 1 {
+		t.Fatalf("got %d disks; want 1", len(disks))
 	}
-	if len(devices) != 0 {
-		t.Errorf("Expected 0 devices, got %d", len(devices))
+	d := disks[0]
+	if d.Name != "sda" || d.CanonicalPath != "/dev/sda" || d.Type != "disk" {
+		t.Errorf("identity = %q %q %q", d.Name, d.CanonicalPath, d.Type)
 	}
-
-	// Unparseable file should be skipped gracefully.
-	badFile := filepath.Join(tmpDir, "b8:99")
-	_ = os.WriteFile(badFile, []byte("NOT A VALID FORMAT"), 0644)
-
-	devices, err = DiscoverDisks(tmpDir, "worker-01")
-	if err != nil {
-		t.Fatalf("DiscoverDisks failed with bad file: %v", err)
+	if d.Path != "/dev/disk/by-id/wwn-0x500253855031cfa5" {
+		t.Errorf("Path = %q; want the wwn symlink", d.Path)
 	}
-	if len(devices) != 0 {
-		t.Errorf("Expected 0 devices, got %d", len(devices))
+	if d.Major != 8 || d.Minor != 0 {
+		t.Errorf("Major/Minor = %d:%d; want 8:0", d.Major, d.Minor)
+	}
+	if d.SysPath != "/devices/pci0000:00/block/sda" {
+		t.Errorf("SysPath = %q", d.SysPath)
+	}
+	if d.Capacity != 512000 {
+		t.Errorf("Capacity = %d; want 512000 (sectors * 512)", d.Capacity)
+	}
+	if d.Rotational == nil || *d.Rotational {
+		t.Errorf("Rotational = %v; want false", d.Rotational)
+	}
+	if d.WWN != "0x500253855031cfa5" || d.SerialShort != "S1ATNEAD511307R" || d.FirmwareVersion != "DXM06B0Q" || d.Bus != "ata" {
+		t.Errorf("udev properties not mapped: %+v", d)
+	}
+	if len(d.Links) != 2 {
+		t.Errorf("Links = %v; want 2", d.Links)
 	}
 }
 
-func TestDiscoverDisks_EdgeCases(t *testing.T) {
-	tmpDir := t.TempDir()
+func TestDiscoverDisksSkipsWhatIsNotAMonitoredDisk(t *testing.T) {
+	h := newFakeHost(t)
+	h.addDisk("sda", "8:0", sataRecord, nil)
+	h.addDisk("loop0", "7:0", "E:ID_FS_TYPE=squashfs\n", nil)
+	h.addDisk("sdb", "8:16", "", nil) // not yet processed by udev
+	h.addDisk("sdc", "8:32", "E:ID_BUS=scsi\nE:ID_VENDOR=IET\nE:ID_MODEL=VIRTUAL-DISK\nE:ID_PATH=ip-10.0.0.1:3260-iscsi-iqn.2019-10.io.longhorn:pvc-1-lun-1\n", nil)
+	h.addDisk("vda", "253:0", "E:ID_PATH=pci-0000:00:04.0\n", nil) // VM disk without most properties
+	// sysfs-rules.rst treats /sys/block and /sys/class/block as interchangeable,
+	// and the latter lists partitions, so a partition in the listing must be
+	// skipped by its "partition" attribute.
+	h.addDisk("sda1", "8:1", sataRecord, map[string]string{"partition": "1\n"})
 
-	// 1. Record with ID_MODEL_ENC fallback when ID_MODEL is empty.
-	content := "E:DEVNAME=/dev/sdd\nE:DEVTYPE=disk\nE:ID_MODEL_ENC=SAMSUNG\\x20MODEL\n"
-	if err := os.WriteFile(filepath.Join(tmpDir, "b8:48"), []byte(content), 0644); err != nil {
-		t.Fatalf("failed to write test file: %v", err)
+	var names []string
+	for _, d := range h.discover() {
+		names = append(names, d.Name)
 	}
-
-	// 2. Record with empty DEVNAME and non-existent Major/Minor (skipped at devName == "").
-	contentEmpty := "E:ID_BUS=scsi\n"
-	if err := os.WriteFile(filepath.Join(tmpDir, "b9999:9999"), []byte(contentEmpty), 0644); err != nil {
-		t.Fatalf("failed to write test file: %v", err)
+	if strings.Join(names, ",") != "sda,vda" {
+		t.Errorf("discovered %v; want [sda vda]", names)
 	}
-
-	devices, err := DiscoverDisks(tmpDir, "worker-01")
-	if err != nil {
-		t.Fatalf("DiscoverDisks failed: %v", err)
-	}
-	if len(devices) != 1 {
-		t.Fatalf("expected 1 device, got %d", len(devices))
-	}
-	if devices[0].Model != "SAMSUNG\\x20MODEL" {
-		t.Errorf("Model = %q; want SAMSUNG\\x20MODEL", devices[0].Model)
-	}
-
 }
 
-func TestParseUdevDataFile_ErrorsAndEdgeCases(t *testing.T) {
-	// Non-existent file.
-	_, err := ParseUdevDataFile("/nonexistent/udev/file")
-	if err == nil {
-		t.Errorf("expected error for non-existent file")
+func TestDiscoverDisksToleratesMissingSysfsAttributes(t *testing.T) {
+	h := newFakeHost(t)
+	h.addDisk("vda", "253:0", "E:ID_PATH=pci-0000:00:04.0\n", map[string]string{"size": "garbage"})
+
+	disks := h.discover()
+	if len(disks) != 1 {
+		t.Fatalf("got %d disks; want 1", len(disks))
+	}
+	if disks[0].Capacity != 0 || disks[0].Rotational != nil {
+		t.Errorf("Capacity = %d, Rotational = %v; want unknown values", disks[0].Capacity, disks[0].Rotational)
+	}
+	if disks[0].Path != "/dev/vda" {
+		t.Errorf("Path = %q; want the kernel path without udev symlinks", disks[0].Path)
+	}
+}
+
+func TestDiscoverDisksSkipsBrokenEntries(t *testing.T) {
+	h := newFakeHost(t)
+	h.addDisk("sda", "8:0", sataRecord, nil)
+	h.addDisk("sdb", "garbage", "", nil)
+	if err := os.Symlink("nowhere", filepath.Join(h.sysDir, "block", "sdc")); err != nil { // vanished mid-scan
+		t.Fatal(err)
 	}
 
-	// File with short lines (< 3 chars) and invalid syntax.
-	tmpDir := t.TempDir()
-	filePath := filepath.Join(tmpDir, "custom_record")
-	content := "\n\nx\nS:disk/by-id/custom\nE:NO_EQUALS_HERE\nE:VALID=OK\n"
-	if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
-		t.Fatalf("failed to write test file: %v", err)
+	if disks := h.discover(); len(disks) != 1 || disks[0].Name != "sda" {
+		t.Errorf("DiscoverDisks() = %+v; want only sda", disks)
 	}
+}
 
-	rec, err := ParseUdevDataFile(filePath)
-	if err != nil {
-		t.Fatalf("ParseUdevDataFile failed: %v", err)
+func TestDiscoverDisksAppliesExcludeRules(t *testing.T) {
+	h := newFakeHost(t)
+	h.addDisk("sda", "8:0", sataRecord, nil)
+
+	if got := h.discover(ExcludeRule{WWN: "0X500253855031CFA5"}); len(got) != 0 {
+		t.Errorf("got %d disks; want the excluded disk to be dropped", len(got))
 	}
-	if rec.Properties["VALID"] != "OK" {
-		t.Errorf("VALID = %q; want OK", rec.Properties["VALID"])
+	if got := h.discover(ExcludeRule{Vendor: "other"}); len(got) != 1 {
+		t.Errorf("got %d disks; want a non-matching rule to keep the disk", len(got))
 	}
-	if len(rec.Symlinks) != 1 || rec.Symlinks[0] != "disk/by-id/custom" {
-		t.Errorf("Symlinks = %v; want [disk/by-id/custom]", rec.Symlinks)
+}
+
+func TestDiscoverDisksMissingSysfs(t *testing.T) {
+	if _, err := DiscoverDisks(t.TempDir(), t.TempDir(), "worker-01"); err == nil {
+		t.Error("expected an error when <sys>/block does not exist")
+	}
+}
+
+// Without the udev database every disk would look unknown, which must not be
+// mistaken for "every disk vanished": the caller would flag all of them missing.
+func TestDiscoverDisksFailsWithoutUdevDatabase(t *testing.T) {
+	h := newFakeHost(t)
+	h.addDisk("sda", "8:0", sataRecord, nil)
+	h.addDisk("loop0", "7:0", "E:ID_FS_TYPE=squashfs\n", nil)
+
+	tests := []struct {
+		name   string
+		udev   string
+		remove []string // records to delete first
+	}{
+		{"directory does not exist", filepath.Join(h.udev, "not-mounted"), nil},
+		// containerd creates a missing hostPath as an empty directory.
+		{"directory is empty", h.udev, []string{"b8:0", "b7:0"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, record := range tt.remove {
+				if err := os.Remove(filepath.Join(h.udev, record)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if disks, err := DiscoverDisks(h.sysDir, tt.udev, "worker-01"); err == nil {
+				t.Errorf("DiscoverDisks() = %+v, nil; want an error", disks)
+			}
+		})
+	}
+}
+
+// A disk without a record is only skipped as long as udev has records for others.
+func TestDiscoverDisksSkipsDiskWithoutRecordIfDatabaseIsPopulated(t *testing.T) {
+	h := newFakeHost(t)
+	h.addDisk("sda", "8:0", sataRecord, nil)
+	h.addDisk("sdb", "8:16", "", nil)
+
+	if disks := h.discover(); len(disks) != 1 || disks[0].Name != "sda" {
+		t.Errorf("DiscoverDisks() = %+v; want only sda", disks)
+	}
+}
+
+func TestDiscoverDisksWithoutBlockDevices(t *testing.T) {
+	h := newFakeHost(t)
+	if disks := h.discover(); len(disks) != 0 {
+		t.Errorf("DiscoverDisks() = %+v; want none", disks)
+	}
+}
+
+func TestDiscoverDisksConvertsSysfsNameToDeviceNode(t *testing.T) {
+	h := newFakeHost(t)
+	// The kernel shows /dev/cciss/c0d0 as "cciss!c0d0" in sysfs.
+	h.addDisk("cciss!c0d0", "104:0", "E:ID_BUS=scsi\n", nil)
+
+	disks := h.discover()
+	if len(disks) != 1 {
+		t.Fatalf("got %d disks; want 1", len(disks))
+	}
+	if disks[0].CanonicalPath != "/dev/cciss/c0d0" || disks[0].Path != "/dev/cciss/c0d0" {
+		t.Errorf("CanonicalPath = %q, Path = %q; want /dev/cciss/c0d0", disks[0].CanonicalPath, disks[0].Path)
+	}
+	if disks[0].Name != "cciss!c0d0" {
+		t.Errorf("Name = %q; want the sysfs name", disks[0].Name)
 	}
 }

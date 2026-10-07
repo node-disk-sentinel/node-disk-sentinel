@@ -2,7 +2,7 @@
 
 ### Can I monitor disks behind a Hardware RAID controller?
 
-Node Disk Sentinel requires a strict **1:1 mapping** between kernel block devices (`/dev/sd*`, `/dev/nvme*n*`) discovered via udev and Kubernetes `PhysicalDisk` resources.
+Node Disk Sentinel requires a strict **1:1 mapping** between kernel block devices (`/dev/sd*`, `/dev/nvme*n*`) discovered via sysfs and udev and Kubernetes `PhysicalDisk` resources.
 
 Hardware RAID controllers typically combine multiple physical disks into virtual logical volumes (e.g. `/dev/sda` with model `LOGICAL_VOLUME`), hiding the underlying physical drives from the operating system:
 - `smartctl` cannot read native SMART health from virtual RAID volumes directly (failing with errors such as `requires option '-d cciss,N'`).
@@ -24,7 +24,7 @@ discovery:
     - "name=sdn"
 ```
 
-Each rule is a comma-separated list of exact key=value matches (`name`, `vendor`, `model`, `serial`, `wwn`, `bus`). All specified fields in a rule must match (AND), and multiple rules act as alternatives (OR).
+Each rule is a comma-separated list of exact key=value matches (`node`, `name`, `vendor`, `model`, `serial`, `wwn`, `bus`; `wwn` is compared case-insensitively). All specified fields in a rule must match (AND), and multiple rules act as alternatives (OR).
 
 Excluded devices are:
 - Not probed via `smartctl`.
@@ -38,7 +38,7 @@ Excluded devices are:
 Kubernetes `PhysicalDisk.status.telemetry` only displays fields supported by the drive's hardware protocol:
 - **ATA/SATA:** Telemetry includes `reallocatedSectors` (ATA 5) and `pendingSectors` (ATA 197).
 - **NVMe:** Telemetry includes `percentageUsed`, `availableSpare`, `criticalWarning`, and `mediaErrors`.
-- **SCSI / SAS:** Enterprise SAS drives do not have ATA attributes. Health is evaluated from SCSI Primary Commands (SPC) error logs (`scsi_error_counter_log`) and grown defect lists.
+- **SCSI / SAS:** Enterprise SAS drives do not have ATA attributes. Health is evaluated from the SCSI Primary Commands (SPC) error counter log (`scsi_error_counter_log`).
 
 Fields that do not apply to a drive are omitted (`omitempty`) in the resource YAML. A healthy SAS drive typically displays `temperatureCelsius` and `powerOnHours`.
 
@@ -46,7 +46,7 @@ Fields that do not apply to a drive are omitted (`omitempty`) in the resource YA
 
 ### Can I manually create `PhysicalDisk` resources?
 
-No. Node Disk Sentinel continuously reconciles `PhysicalDisk` resources against the node's local udev hardware database. If a resource has no corresponding kernel block device on the host, the reconciler marks it as `DiskMissing`.
+No. Node Disk Sentinel continuously reconciles `PhysicalDisk` resources against the node's local hardware inventory (sysfs and the udev database). If a resource has no corresponding kernel block device on the host, the reconciler marks it as `DiskMissing`.
 
 ---
 
@@ -94,7 +94,7 @@ No. Node Disk Sentinel is designed explicitly to avoid treating `etcd` as a time
 
 Node Disk Sentinel's evaluation cascade is grounded in formal storage specifications, empirical failure research, and established industry concepts:
 
-- **ATA Disks:** The ATA evaluation logic incorporates proven tiered-severity concepts inspired by `libatasmart`, prioritizing manufacturer-calibrated thresholds over synthetic heuristics to avoid false positives.
+- **ATA Disks:** The ATA evaluation follows the severity order of `libatasmart` (self-assessment, many bad sectors, attribute failing now, bad sectors, attribute failed in the past). Attributes that breach their manufacturer thresholds rank above the plain bad-sector count.
 - **NVMe Drives (NVM Express Base Specification):** Evaluates hardware-level indicators defined in the official NVMe specification, specifically the `Critical Warning` bitmask (temperature, degraded reliability, read-only mode, volatile memory backup failure), `Available Spare` capacity against warning thresholds, and `Percentage Used` (endurance).
-- **SCSI / SAS Disks (SCSI Primary Commands / SPC):** Monitors SCSI error counter logs (`scsi_error_counter_log`) and grown defect lists for uncorrected read/write errors as defined by the SPC and SBC standards.
-- **Empirical Failure Research (Backblaze Drive Stats):** Large-scale reliability studies on hundreds of thousands of operational drives have demonstrated that bad sectors, specifically raw counts of `Reallocated Sectors` (ATA 5) and `Current Pending Sectors` (ATA 197), as well as NVMe Media Errors, are the strongest statistical leading indicators of impending drive failure, well before manufacturer thresholds are breached or overall self-tests fail.
+- **SCSI / SAS Disks (SCSI Primary Commands / SPC):** Monitors the SCSI error counter log (`scsi_error_counter_log`) for uncorrected read and write errors, as defined by the SPC standard.
+- **Empirical Failure Research (Backblaze Drive Stats):** The SMART statistics Backblaze published in 2016 ([What SMART Stats Tell Us About Hard Drives](https://www.backblaze.com/blog/what-smart-stats-indicate-hard-drive-failures/)) track five attributes (SMART 5, 187, 188, 197 and 198). 76.7 % of the failed drives, but only 4.2 % of the operational ones, had a raw value above zero in at least one of them. Node Disk Sentinel evaluates the raw counts of `Reallocated Sectors` (ATA 5) and `Current Pending Sectors` (ATA 197) and treats NVMe `Media Errors` as the analogous signal; a non-zero count is reported as `SectorErrors` even if no manufacturer threshold is breached. The Backblaze data covers hard drives only.

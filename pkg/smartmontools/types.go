@@ -141,8 +141,8 @@ type NvmeSmartHealth struct {
 }
 
 // ScsiErrorLog mirrors the nested shape smartctl uses for SCSI counters. Its
-// presence is what identifies a SCSI device; the counters themselves are not
-// part of the health assessment.
+// presence identifies a SCSI device; the uncorrected error totals feed the
+// health assessment.
 type ScsiErrorLog struct {
 	Read  *ScsiErrorCounters `json:"read,omitempty"`
 	Write *ScsiErrorCounters `json:"write,omitempty"`

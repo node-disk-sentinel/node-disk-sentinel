@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -16,6 +15,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
@@ -36,12 +36,16 @@ import (
 const (
 	defaultPollInterval  = 10 * time.Minute
 	defaultEventDebounce = time.Second
+
+	// monitorRetryInterval is the pause before the udev monitor is restarted.
+	monitorRetryInterval = 10 * time.Second
 )
 
 // MonitorOptions contains configuration options for the local disk monitor and reconciler.
 type MonitorOptions struct {
 	NodeName      string
-	UdevDataDir   string
+	SysDir        string // sysfs mount, defaults to /sys
+	UdevDataDir   string // udev runtime database, defaults to /run/udev/data
 	PollInterval  time.Duration
 	EventDebounce time.Duration
 	ExcludeRules  []discovery.ExcludeRule
@@ -55,8 +59,11 @@ type DiskMonitor struct {
 	SmartRunner smartmontools.Runner
 	Options     MonitorOptions
 
-	mu      sync.RWMutex
-	nodeRef *corev1.Node
+	// watch reports inventory changes by calling trigger until ctx is done. It
+	// is discovery.Monitor, except in tests.
+	watch func(ctx context.Context, trigger func()) error
+
+	nodeRef atomic.Pointer[corev1.Node]
 	ready   atomic.Bool
 }
 
@@ -73,11 +80,13 @@ func NewDiskMonitor(c client.Client, recorder record.EventRecorder, runner smart
 		Recorder:    recorder,
 		SmartRunner: runner,
 		Options:     opts,
+		watch:       discovery.Monitor,
 	}
 }
 
-// ignoreNonUpdateEvents prevents redundant reconciliations for resources created
-// by the local inventory loop. GenerationChangedPredicate handles update events.
+// ignoreNonUpdateEvents drops create, delete and generic events: the local
+// inventory loop creates and deletes PhysicalDisks itself and needs no reconcile
+// for them. Update events are filtered by GenerationChangedPredicate.
 var ignoreNonUpdateEvents = predicate.Funcs{
 	CreateFunc: func(event.CreateEvent) bool {
 		return false
@@ -122,7 +131,7 @@ func (m *DiskMonitor) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Res
 	klog.InfoS("Reconciling PhysicalDisk on spec change", "disk", physicalDisk.Name, "node", physicalDisk.Spec.NodeName)
 
 	// Reconcile this specific disk using current hardware inventory.
-	diskInfos, err := discovery.DiscoverDisks(m.Options.UdevDataDir, m.Options.NodeName, m.Options.ExcludeRules...)
+	diskInfos, err := discovery.DiscoverDisks(m.Options.SysDir, m.Options.UdevDataDir, m.Options.NodeName, m.Options.ExcludeRules...)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to discover disks: %w", err)
 	}
@@ -148,193 +157,72 @@ func (m *DiskMonitor) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Res
 	return ctrl.Result{}, nil
 }
 
-// Start implements manager.Runnable, running local udev event listener and
-// periodic polling loop alongside the controller-runtime manager.
+// Start implements manager.Runnable. It reconciles the local disk inventory
+// whenever the udev monitor reports a change, and periodically as a backstop.
 func (m *DiskMonitor) Start(ctx context.Context) error {
 	// Cache Node reference for ownerReference injection.
 	var node corev1.Node
 	if err := m.Get(ctx, client.ObjectKey{Name: m.Options.NodeName}, &node); err != nil {
 		return fmt.Errorf("failed to get node %s for ownerReference: %w", m.Options.NodeName, err)
 	}
-	m.mu.Lock()
-	m.nodeRef = &node
-	m.mu.Unlock()
+	m.nodeRef.Store(&node)
+	defer m.ready.Store(false)
 
+	// dirty holds "the inventory may have changed". Any number of hints collapse
+	// into one pending scan, so the event reader never blocks on a slow scan.
+	dirty := make(chan struct{}, 1)
+	trigger := func() {
+		select {
+		case dirty <- struct{}{}:
+		default:
+		}
+	}
+
+	// The first scan covers disks that existed before the pod started. It also
+	// runs where no events arrive, for example in a Kind node, which does not
+	// share the host's network namespace.
+	trigger()
+
+	// Events from before the socket was bound are not replayed, so the monitor
+	// triggers a scan right after every (re)bind. At start-up that trigger and the
+	// one above fall into the same delay and cost one scan.
+	go wait.UntilWithContext(ctx, func(ctx context.Context) {
+		if err := m.watch(ctx, trigger); err != nil && ctx.Err() == nil {
+			klog.ErrorS(err, "udev monitor stopped, reconnecting", "retryIn", monitorRetryInterval)
+		}
+	}, monitorRetryInterval)
+
+	// Netlink multicast is lossy and not replayable, so a periodic full scan is
+	// the authoritative repair path for every missed notification.
 	ticker := time.NewTicker(m.Options.PollInterval)
 	defer ticker.Stop()
-
-	// Initial hardware inventory scan. This covers disks that existed before the
-	// pod started; netlink only delivers future multicast packets and is not a
-	// replayable history. There is an unavoidable small race between this scan and
-	// binding the listener below, which the recurring full inventory scan repairs.
-	if err := m.ReconcileAll(ctx); err != nil {
-		klog.ErrorS(err, "Initial hardware reconcile failed")
-	}
-	m.ready.Store(true)
-
-	events, stopListener := m.startEventListener(ctx)
-	defer stopListener()
-
-	var debounce *time.Timer
-	var debounced <-chan time.Time
-	defer func() {
-		if debounce != nil {
-			debounce.Stop()
-		}
-	}()
 
 	for {
 		select {
 		case <-ctx.Done():
-			m.ready.Store(false)
 			return nil
-
 		case <-ticker.C:
-			// Netlink multicast is an optimization, not a durable event log. The kernel
-			// may drop queued packets during a hotplug storm, and this process can start
-			// after the hardware already exists. A full periodic scan is therefore the
-			// authoritative repair path for missed add, change, and remove notifications.
-			if err := m.ReconcileAll(ctx); err != nil {
-				klog.ErrorS(err, "Periodic reconcile failed")
+		case <-dirty:
+			// Several disks usually appear together (boot, HBA or enclosure
+			// hot-plug) and announce themselves one by one. Wait a fixed delay after
+			// the first hint instead of restarting a timer on every event, so a
+			// steady event stream cannot postpone the scan indefinitely.
+			select {
+			case <-time.After(m.Options.EventDebounce):
+			case <-ctx.Done():
+				return nil
 			}
-
-		case uevent, ok := <-events:
-			if !ok {
-				// A nil channel is disabled in a select. This prevents a stopped listener
-				// from causing a busy loop while retaining the periodic recovery path.
-				events = nil
-				continue
-			}
-			switch uevent.Action {
-			case discovery.ActionRemove, discovery.ActionOffline:
-				// IMMEDIATE ACTION ON REMOVAL:
-				// When a drive is detached or pulled from a hot-swap bay, issuing further
-				// smartctl or sysfs reads will block or fail with EIO.
-				// We do NOT debounce removals; we immediately mark the PhysicalDisk CR
-				// status as missing and delete exported Prometheus metrics so Kubernetes
-				// controllers and storage operators are alerted without delay.
-				m.handleDeviceRemoval(ctx, uevent)
-			case discovery.ActionAdd, discovery.ActionChange, discovery.ActionOnline:
-				// DEBOUNCING HARDWARE EVENT STORMS:
-				// When a storage device is inserted, Linux triggers a cascade of uevents:
-				//   1. Whole-disk registration ("add" for sda).
-				//   2. Kernel partition scanning ("add" for sda1, sda2...).
-				//   3. udev helper rules execution ("change" after blkid / ata_id / scsi_id).
-				//   4. Filesystem or volume manager probes ("change").
-				// Reconciling synchronously on each individual event would hammer the node
-				// with 5-10 redundant, expensive smartctl queries and API server updates.
-				// Debouncing collapses the entire flurry into a single reconcile run
-				// once the quiet period (default: 1s) elapses.
-				klog.V(4).InfoS("Queueing reconcile for block device uevent",
-					"action", uevent.Action, "device", uevent.KernelName())
-				if debounce == nil {
-					debounce = time.NewTimer(m.Options.EventDebounce)
-					debounced = debounce.C
-				} else {
-					debounce.Reset(m.Options.EventDebounce)
-				}
-			case discovery.ActionRescan:
-				// ENOBUFS means one or more events were lost. Reconcile immediately and
-				// discard a pending debounce timer: its scan is now redundant and could
-				// otherwise run shortly after this full recovery reconciliation.
-				if debounce != nil {
-					debounce.Stop()
-					debounce, debounced = nil, nil
-				}
-				klog.InfoS("Triggering immediate reconcile due to udev buffer overrun")
-				if err := m.ReconcileAll(ctx); err != nil {
-					klog.ErrorS(err, "Reconcile after udev buffer overrun failed")
-				}
-			}
-
-		case <-debounced:
-			debounce, debounced = nil, nil
-			if err := m.ReconcileAll(ctx); err != nil {
-				klog.ErrorS(err, "Reconcile after udev event burst failed")
+			// Hints that arrived during the window are covered by this scan.
+			select {
+			case <-dirty:
+			default:
 			}
 		}
-	}
-}
 
-// startEventListener subscribes to udev events. If the socket is unavailable
-// (for example in a container without hostNetwork or without access to the host
-// netlink namespace), the monitor logs the failure and gracefully retries periodically.
-// If the listener encounters an unexpected error, a supervisor loop automatically
-// reconnects to ensure event monitoring is not permanently lost.
-func (m *DiskMonitor) startEventListener(ctx context.Context) (<-chan *discovery.UEvent, func()) {
-	events := make(chan *discovery.UEvent, 32)
-	done := make(chan struct{})
-
-	go func() {
-		defer close(done)
-		defer close(events)
-
-		for {
-			listener, err := discovery.NewUEventListener()
-			if err != nil {
-				klog.ErrorS(err, "Failed to start udev netlink listener; retrying in 10s")
-				select {
-				case <-time.After(10 * time.Second):
-					continue
-				case <-ctx.Done():
-					return
-				}
-			}
-
-			klog.InfoS("Udev netlink event listener active")
-			if err := listener.Listen(ctx, events); err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				klog.ErrorS(err, "Udev netlink listener stopped with error; reconnecting in 5s")
-				select {
-				case <-time.After(5 * time.Second):
-					continue
-				case <-ctx.Done():
-					return
-				}
-			} else {
-				if ctx.Err() != nil {
-					// Clean shutdown via context.
-					return
-				}
-				klog.Warning("Udev netlink listener stopped unexpectedly; reconnecting in 5s")
-				select {
-				case <-time.After(5 * time.Second):
-					continue
-				case <-ctx.Done():
-					return
-				}
-			}
+		if err := m.ReconcileAll(ctx); err != nil {
+			klog.ErrorS(err, "Reconcile failed")
 		}
-	}()
-
-	return events, func() { <-done }
-}
-
-// handleDeviceRemoval flags the disks of a removed device as missing.
-func (m *DiskMonitor) handleDeviceRemoval(ctx context.Context, uevent *discovery.UEvent) {
-	var diskList v1alpha1.PhysicalDiskList
-	if err := m.List(ctx, &diskList, client.MatchingLabels{
-		utils.LabelNodeName: utils.MustFormatValue(m.Options.NodeName),
-	}); err != nil {
-		klog.ErrorS(err, "Failed to list physical disks for removal event")
-		return
-	}
-
-	// Match by the kernel name saved at the last inventory scan. We cannot use the
-	// preferred by-id symlink here: udev removes that symlink as part of processing a
-	// removal event, while DEVPATH still retains the kernel name (see KernelName).
-	devName := uevent.KernelName()
-	for i := range diskList.Items {
-		disk := &diskList.Items[i]
-		if disk.Spec.NodeName != m.Options.NodeName || disk.Status.Info.Name != devName {
-			continue
-		}
-
-		if err := m.markDiskMissing(ctx, disk, fmt.Sprintf("Device was removed from the node (udev action %q)", uevent.Action)); err != nil {
-			klog.ErrorS(err, "Failed to mark removed disk as missing", "disk", disk.Name)
-		}
+		m.ready.Store(true)
 	}
 }
 
@@ -370,23 +258,29 @@ func (m *DiskMonitor) markDiskMissing(ctx context.Context, disk *v1alpha1.Physic
 	return nil
 }
 
-// ReconcileAll discovers local disks and updates their corresponding PhysicalDisk CRs.
+// ReconcileAll discovers the local disks, updates their PhysicalDisk CRs, and
+// deletes or marks as missing the CRs whose disk is excluded or gone.
 func (m *DiskMonitor) ReconcileAll(ctx context.Context) error {
-	diskInfos, err := discovery.DiscoverDisks(m.Options.UdevDataDir, m.Options.NodeName, m.Options.ExcludeRules...)
+	diskInfos, err := discovery.DiscoverDisks(m.Options.SysDir, m.Options.UdevDataDir, m.Options.NodeName, m.Options.ExcludeRules...)
 	if err != nil {
 		return fmt.Errorf("failed to discover disks: %w", err)
 	}
 
 	klog.InfoS("Discovered physical disks on node", "node", m.Options.NodeName, "count", len(diskInfos))
 
-	for _, diskInfo := range diskInfos {
-		if err := m.reconcileDisk(ctx, diskInfo); err != nil {
-			klog.ErrorS(err, "Failed to reconcile disk", "device", diskInfo.Name, "path", diskInfo.Path)
-		}
-	}
+	// Removals come first: they are cheap and must not wait for the slow
+	// smartctl runs below.
+	errs := []error{m.markAbsentDisks(ctx, diskInfos)}
 
-	// A periodic scan must also detect removals because netlink events can be
-	// missed while the process is restarting or, in Kind, are not forwarded.
+	for _, diskInfo := range diskInfos {
+		errs = append(errs, m.reconcileDisk(ctx, diskInfo))
+	}
+	return errors.Join(errs...)
+}
+
+// markAbsentDisks deletes PhysicalDisks that are excluded by a rule and marks
+// those that are no longer part of the discovered inventory as missing.
+func (m *DiskMonitor) markAbsentDisks(ctx context.Context, diskInfos []v1alpha1.DiskInfo) error {
 	var diskList v1alpha1.PhysicalDiskList
 	if err := m.List(ctx, &diskList, client.MatchingLabels{
 		utils.LabelNodeName: utils.MustFormatValue(m.Options.NodeName),
@@ -394,29 +288,29 @@ func (m *DiskMonitor) ReconcileAll(ctx context.Context) error {
 		return fmt.Errorf("failed to list physical disks: %w", err)
 	}
 
-	discoveredNames := make(map[string]struct{}, len(diskInfos))
+	discovered := make(map[string]struct{}, len(diskInfos))
 	for _, diskInfo := range diskInfos {
-		discoveredNames[discovery.GenerateCRName(m.Options.NodeName, &diskInfo)] = struct{}{}
+		discovered[discovery.GenerateCRName(m.Options.NodeName, &diskInfo)] = struct{}{}
 	}
 
+	var errs []error
 	for i := range diskList.Items {
 		disk := &diskList.Items[i]
 		if disk.Spec.NodeName != m.Options.NodeName {
 			continue
 		}
-		if deleted, err := m.deleteIfExcluded(ctx, disk); err != nil {
-			return err
-		} else if deleted {
+		deleted, err := m.deleteIfExcluded(ctx, disk)
+		if err != nil {
+			errs = append(errs, err)
 			continue
 		}
-		if _, exists := discoveredNames[disk.Name]; !exists {
+		if _, ok := discovered[disk.Name]; !deleted && !ok {
 			if err := m.markDiskMissing(ctx, disk, "Hardware device not found during inventory scan"); err != nil {
-				return err
+				errs = append(errs, err)
 			}
 		}
 	}
-
-	return nil
+	return errors.Join(errs...)
 }
 
 // deleteIfExcluded deletes a PhysicalDisk and drops its metrics if it matches an exclusion rule.
@@ -462,16 +356,20 @@ func (m *DiskMonitor) reconcileDisk(ctx context.Context, diskInfo v1alpha1.DiskI
 	}
 
 	// Ensure label is present on existing disks.
-	if physicalDisk.Labels == nil || physicalDisk.Labels[utils.LabelNodeName] != nodeLabelValue {
+	if physicalDisk.Labels[utils.LabelNodeName] != nodeLabelValue {
+		base := physicalDisk.DeepCopy()
 		if physicalDisk.Labels == nil {
 			physicalDisk.Labels = make(map[string]string)
 		}
 		physicalDisk.Labels[utils.LabelNodeName] = nodeLabelValue
-		if err := m.Update(ctx, &physicalDisk); err != nil && !apierrors.IsConflict(err) {
+		if err := m.Patch(ctx, &physicalDisk, client.MergeFrom(base)); err != nil {
 			klog.V(2).InfoS("Failed to ensure node label on disk", "disk", name, "error", err)
 		}
 	}
 
+	// The status is patched (not updated), so a concurrent write to the resource
+	// cannot cause a conflict while the slow smartctl run is in progress.
+	base := physicalDisk.DeepCopy()
 	physicalDisk.Status.Info = diskInfo
 
 	var extraCmdArgs string
@@ -490,30 +388,9 @@ func (m *DiskMonitor) reconcileDisk(ctx context.Context, diskInfo v1alpha1.DiskI
 		m.applyCollectionSuccess(&physicalDisk, diskInfo, smartData)
 	}
 
-	var latestDisk v1alpha1.PhysicalDisk
-	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		if err := m.Get(ctx, client.ObjectKey{Name: name}, &latestDisk); err != nil {
-			return err
-		}
-		latestDisk.Status.Info = physicalDisk.Status.Info
-		latestDisk.Status.Health = physicalDisk.Status.Health
-		latestDisk.Status.Findings = physicalDisk.Status.Findings
-		if physicalDisk.Status.LastDataCollectedTime != nil {
-			latestDisk.Status.LastDataCollectedTime = physicalDisk.Status.LastDataCollectedTime
-		}
-		if physicalDisk.Status.Telemetry != nil {
-			latestDisk.Status.Telemetry = physicalDisk.Status.Telemetry
-		}
-		for _, c := range physicalDisk.Status.Conditions {
-			meta.SetStatusCondition(&latestDisk.Status.Conditions, c)
-		}
-		return m.Status().Update(ctx, &latestDisk)
-	})
-	if err != nil {
+	if err := m.Status().Patch(ctx, &physicalDisk, client.MergeFrom(base)); err != nil {
 		return fmt.Errorf("failed to update status of %s: %w", name, err)
 	}
-
-	physicalDisk.Status = latestDisk.Status
 
 	klog.InfoS("Reconciled physical disk",
 		"disk", name, "status", physicalDisk.Status.Health, "path", diskInfo.Path)
@@ -526,16 +403,15 @@ func (m *DiskMonitor) Ready() bool {
 }
 
 func (m *DiskMonitor) ownerReferences() []metav1.OwnerReference {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.nodeRef == nil {
+	node := m.nodeRef.Load()
+	if node == nil {
 		return nil
 	}
 	return []metav1.OwnerReference{{
 		APIVersion: "v1",
 		Kind:       "Node",
-		Name:       m.nodeRef.Name,
-		UID:        m.nodeRef.UID,
+		Name:       node.Name,
+		UID:        node.UID,
 		Controller: new(false),
 	}}
 }

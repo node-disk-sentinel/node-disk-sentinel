@@ -8,7 +8,7 @@ image:
 # Interval between periodic SMART and hardware discovery polling cycles.
 pollInterval: "10m"
 
-# Quiet period to buffer rapid bursts of udev device events before triggering reconcile.
+# Delay after the first udev add/remove event, so that a burst of events causes one reconcile.
 eventDebounce: "1s"
 
 # Timeout for each individual smartctl execution.

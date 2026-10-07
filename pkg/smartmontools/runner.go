@@ -53,16 +53,13 @@ type ExecRunner struct {
 	Timeout    time.Duration
 }
 
-// NewExecRunner returns an ExecRunner with sane defaults.
-func NewExecRunner() *ExecRunner {
-	return &ExecRunner{BinaryPath: "smartctl", Timeout: 30 * time.Second}
-}
-
 // Collect runs "smartctl --json --all --nocheck=standby" against the device
 // with any configured additional command-line arguments.
 //
-// --nocheck=standby keeps sleeping disks asleep, which makes an exit status
-// with exitBitDeviceOpen an expected outcome rather than a failure. Higher bits
+// --nocheck=standby makes smartctl skip a disk in sleep or standby mode, which
+// makes an exit status with exitBitDeviceOpen an expected outcome rather than a
+// failure. smartctl(8) warns that its device type autodetection may still spin a
+// disk up; for such disks set the type with -d through extraCmdArgs. Higher bits
 // describe the health of the disk and still come with usable data, so they are
 // reported through the parsed output instead of an error.
 func (r *ExecRunner) Collect(ctx context.Context, devicePath, extraCmdArgs string) (*SmartctlOutput, error) {

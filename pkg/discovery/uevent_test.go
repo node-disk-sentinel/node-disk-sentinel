@@ -6,479 +6,361 @@ package discovery
 import (
 	"context"
 	"encoding/binary"
-	"errors"
 	"os"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
 
-// newUdevMessage builds a synthetic udev-processed netlink message matching the exact
-// binary layout of struct udev_monitor_netlink_header sent by systemd-udevd:
-//
-//	[0..7]   "libudev\0"
-//	[8..11]  0xfeedcafe (big-endian magic via htonl)
-//	[12..15] header_size (40 bytes, native endian)
-//	[16..19] properties_off (40 bytes, native endian)
-//
-// followed by the NUL-separated environment payload.
+// newUdevMessage builds a message in the layout of struct monitor_netlink_header
+// followed by the NUL separated properties.
 func newUdevMessage(payload string) []byte {
-	message := make([]byte, libudevHeaderLength)
-	copy(message, libudevPrefix)
-	binary.BigEndian.PutUint32(message[libudevMagicOffset:], libudevMagic)
-	binary.NativeEndian.PutUint32(message[libudevHeaderSizeOff:], libudevHeaderLength)
-	binary.NativeEndian.PutUint32(message[libudevPayloadOff:], libudevHeaderLength)
-	return append(message, payload...)
+	msg := make([]byte, minHeader)
+	copy(msg, prefix)
+	binary.BigEndian.PutUint32(msg[magicOff:], magic)
+	binary.NativeEndian.PutUint32(msg[12:], minHeader) // header_size
+	binary.NativeEndian.PutUint32(msg[propsOff:], minHeader)
+	return append(msg, payload...)
 }
 
-func TestParseUEventPayload_Add(t *testing.T) {
-	raw := newUdevMessage("ACTION=add\x00" +
-		"DEVPATH=/devices/pci0000:00/0000:00:1f.2/ata1/host0/target0:0:0/0:0:0:0/block/sda\x00" +
-		"SUBSYSTEM=block\x00" +
-		"DEVNAME=/dev/sda\x00" +
-		"DEVTYPE=disk\x00" +
-		"MAJOR=8\x00" +
-		"MINOR=0\x00\x00")
+func blockEvent(action, name string) []byte {
+	return newUdevMessage("ACTION=" + action + "\x00DEVPATH=/devices/pci0000:00/block/" + name +
+		"\x00SUBSYSTEM=block\x00DEVNAME=/dev/" + name + "\x00DEVTYPE=disk\x00")
+}
 
-	uevent, err := ParseUEventPayload(raw)
+func TestParseMessage(t *testing.T) {
+	env, err := parseMessage(newUdevMessage("ACTION=add\x00DEVPATH=/devices/x/block/sda\x00SUBSYSTEM=block\x00DEVTYPE=disk\x00ID_MODEL=A=B"))
 	if err != nil {
-		t.Fatalf("ParseUEventPayload failed: %v", err)
+		t.Fatalf("parseMessage failed: %v", err)
 	}
-
-	if uevent.Action != "add" {
-		t.Errorf("Action = %q; want add", uevent.Action)
-	}
-	if uevent.Subsystem != "block" {
-		t.Errorf("Subsystem = %q; want block", uevent.Subsystem)
-	}
-	if uevent.DevName != "/dev/sda" {
-		t.Errorf("DevName = %q; want /dev/sda", uevent.DevName)
-	}
-	if uevent.DevType != "disk" {
-		t.Errorf("DevType = %q; want disk", uevent.DevType)
-	}
-	if uevent.KernelName() != "sda" {
-		t.Errorf("KernelName() = %q; want sda", uevent.KernelName())
-	}
-	if uevent.Env["MAJOR"] != "8" || uevent.Env["MINOR"] != "0" {
-		t.Errorf("MAJOR/MINOR = %q/%q; want 8/0", uevent.Env["MAJOR"], uevent.Env["MINOR"])
+	want := map[string]string{"ACTION": "add", "DEVPATH": "/devices/x/block/sda", "SUBSYSTEM": "block", "DEVTYPE": "disk", "ID_MODEL": "A=B"}
+	for k, v := range want {
+		if env[k] != v {
+			t.Errorf("env[%q] = %q; want %q", k, env[k], v)
+		}
 	}
 }
 
-func TestParseUEventPayload_Remove(t *testing.T) {
-	raw := newUdevMessage("ACTION=remove\x00" +
-		"DEVPATH=/devices/pci0000:00/0000:00:1f.2/ata1/host0/target0:0:0/0:0:0:0/block/sdb\x00" +
-		"SUBSYSTEM=block\x00" +
-		"DEVNAME=/dev/sdb\x00" +
-		"DEVTYPE=disk\x00\x00")
-
-	uevent, err := ParseUEventPayload(raw)
+// TestParseMessageRealDatagram decodes a message captured from systemd-udevd
+// 255.4 (Ubuntu 24.04) on the udev group while a loop device was set up with
+// udisksctl. Unlike newUdevMessage it does not depend on our reading of the
+// format; the expected values are what "udevadm monitor --udev --property"
+// printed for the same event.
+func TestParseMessageRealDatagram(t *testing.T) {
+	raw, err := os.ReadFile("testdata/udevd-change-loop0.bin")
 	if err != nil {
-		t.Fatalf("ParseUEventPayload failed: %v", err)
+		t.Fatal(err)
 	}
-	if uevent.Action != "remove" {
-		t.Errorf("Action = %q; want remove", uevent.Action)
-	}
-	if uevent.KernelName() != "sdb" {
-		t.Errorf("KernelName() = %q; want sdb", uevent.KernelName())
-	}
-}
-
-// KernelName must still identify the device when udev omits DEVNAME, which
-// happens for some remove events.
-func TestUEventKernelNameFallsBackToDevPath(t *testing.T) {
-	raw := newUdevMessage("ACTION=remove\x00" +
-		"DEVPATH=/devices/virtual/block/nvme0n1\x00" +
-		"SUBSYSTEM=block\x00" +
-		"DEVTYPE=disk\x00\x00")
-
-	uevent, err := ParseUEventPayload(raw)
+	env, err := parseMessage(raw)
 	if err != nil {
-		t.Fatalf("ParseUEventPayload failed: %v", err)
+		t.Fatalf("parseMessage failed: %v", err)
 	}
-	if uevent.KernelName() != "nvme0n1" {
-		t.Errorf("KernelName() = %q; want nvme0n1", uevent.KernelName())
+	want := map[string]string{
+		"ACTION": "change", "DEVPATH": "/devices/virtual/block/loop0", "SUBSYSTEM": "block",
+		"DEVNAME": "/dev/loop0", "DEVTYPE": "disk", "MAJOR": "7", "MINOR": "0", "SEQNUM": "7073",
+		"ID_LOOP_BACKING_DEVICE": "259:1", "TAGS": ":systemd:",
+		"DEVLINKS": "/dev/disk/by-loop-inode/259:1-39720277 /dev/disk/by-diskseq/14",
+	}
+	for k, v := range want {
+		if env[k] != v {
+			t.Errorf("env[%q] = %q; want %q", k, env[k], v)
+		}
+	}
+	if len(env) != 16 {
+		t.Errorf("got %d properties; want 16: %v", len(env), env)
 	}
 }
 
-func TestParseUEventPayload_Rejects(t *testing.T) {
-	invalidMagic := make([]byte, libudevHeaderLength)
-	copy(invalidMagic, libudevPrefix)
-	binary.NativeEndian.PutUint32(invalidMagic[libudevHeaderSizeOff:], libudevHeaderLength)
-	binary.NativeEndian.PutUint32(invalidMagic[libudevPayloadOff:], libudevHeaderLength)
-
-	badOffset := make([]byte, libudevHeaderLength)
-	copy(badOffset, libudevPrefix)
-	binary.BigEndian.PutUint32(badOffset[libudevMagicOffset:], libudevMagic)
-	binary.NativeEndian.PutUint32(badOffset[libudevHeaderSizeOff:], libudevHeaderLength)
-	binary.NativeEndian.PutUint32(badOffset[libudevPayloadOff:], 4096)
-
-	smallHeader := newUdevMessage("ACTION=add\x00DEVPATH=/dev/sda\x00")
-	binary.NativeEndian.PutUint32(smallHeader[libudevHeaderSizeOff:], 20)
-
-	largeHeader := newUdevMessage("ACTION=add\x00DEVPATH=/dev/sda\x00")
-	binary.NativeEndian.PutUint32(largeHeader[libudevHeaderSizeOff:], uint32(len(largeHeader)+100))
-
-	smallOffset := newUdevMessage("ACTION=add\x00DEVPATH=/dev/sda\x00")
-	binary.NativeEndian.PutUint32(smallOffset[libudevPayloadOff:], 20)
+func TestParseMessageRejects(t *testing.T) {
+	badMagic := newUdevMessage("ACTION=add\x00")
+	binary.BigEndian.PutUint32(badMagic[magicOff:], 1)
+	offsetOutOfRange := newUdevMessage("ACTION=add\x00")
+	binary.NativeEndian.PutUint32(offsetOutOfRange[propsOff:], 4096)
+	offsetInHeader := newUdevMessage("ACTION=add\x00")
+	binary.NativeEndian.PutUint32(offsetInHeader[propsOff:], 20)
 
 	tests := []struct {
 		name    string
 		raw     []byte
 		wantErr string
 	}{
-		{"empty", nil, "not a udev-processed event"},
-		{"raw kernel event", []byte("add@/devices/virtual/block/sda\x00ACTION=add\x00"), "not a udev-processed event"},
-		{"truncated header", libudevPrefix, "truncated libudev header"},
-		{"invalid magic", invalidMagic, "invalid libudev magic"},
-		{"header size too small", smallHeader, "invalid libudev header size"},
-		{"header size exceeds datagram", largeHeader, "invalid libudev header size"},
-		{"payload offset smaller than header", smallOffset, "invalid libudev payload offset"},
-		{"payload offset out of range", badOffset, "invalid libudev payload offset"},
-		{"missing action", newUdevMessage("DEVPATH=/devices/pci/block/sda\x00SUBSYSTEM=block\x00"), "missing ACTION or DEVPATH"},
-		{"missing devpath", newUdevMessage("ACTION=add\x00SUBSYSTEM=block\x00\x00"), "missing ACTION or DEVPATH"},
+		{"empty", nil, "not a libudev message"},
+		{"raw kernel event", []byte("add@/devices/virtual/block/sda\x00ACTION=add\x00SUBSYSTEM=block\x00"), "not a libudev message"},
+		{"truncated header", []byte(prefix), "not a libudev message"},
+		{"bad magic", badMagic, "invalid libudev magic"},
+		{"offset inside header", offsetInHeader, "invalid properties offset"},
+		{"offset beyond datagram", offsetOutOfRange, "invalid properties offset"},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, err := ParseUEventPayload(tt.raw); err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+			if _, err := parseMessage(tt.raw); err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("error = %v; want it to contain %q", err, tt.wantErr)
 			}
 		})
 	}
 }
 
-func TestParseUEventPayload_PropertiesLen(t *testing.T) {
-	raw := newUdevMessage("ACTION=add\x00" +
-		"DEVPATH=/devices/virtual/block/sdd\x00" +
-		"SUBSYSTEM=block\x00" +
-		"DEVNAME=/dev/sdd\x00" +
-		"DEVTYPE=disk\x00")
-	propsLen := len(raw) - libudevHeaderLength
-	binary.NativeEndian.PutUint32(raw[libudevPropsLenOff:], uint32(propsLen))
-	rawWithGarbage := append(raw, []byte("GARBAGE=SHOULD_BE_IGNORED\x00")...)
-
-	uevent, err := ParseUEventPayload(rawWithGarbage)
-	if err != nil {
-		t.Fatalf("ParseUEventPayload failed: %v", err)
-	}
-	if uevent.Env["GARBAGE"] != "" {
-		t.Errorf("expected GARBAGE to be ignored beyond properties_len, but found: %q", uevent.Env["GARBAGE"])
-	}
-}
-
-func TestParseUEventPayload_OversizedPropertiesLenUsesPacketBoundary(t *testing.T) {
-	raw := newUdevMessage("ACTION=add\x00" +
-		"DEVPATH=/devices/virtual/block/sde\x00" +
-		"SUBSYSTEM=block\x00" +
-		"DEVNAME=/dev/sde\x00" +
-		"DEVTYPE=disk\x00")
-	binary.NativeEndian.PutUint32(raw[libudevPropsLenOff:], ^uint32(0))
-
-	uevent, err := ParseUEventPayload(raw)
-	if err != nil {
-		t.Fatalf("ParseUEventPayload failed for oversized properties length: %v", err)
-	}
-	if uevent.DevName != "/dev/sde" {
-		t.Errorf("DevName = %q; want /dev/sde", uevent.DevName)
-	}
-}
-
-func TestParseUEventPayload_NoTrailingNul(t *testing.T) {
-	raw := newUdevMessage("ACTION=add\x00DEVPATH=/devices/virtual/block/sdf\x00SUBSYSTEM=block\x00DEVNAME=/dev/sdf\x00DEVTYPE=disk") // no trailing \x00
-	uevent, err := ParseUEventPayload(raw)
-	if err != nil {
-		t.Fatalf("ParseUEventPayload failed: %v", err)
-	}
-	if uevent.DevType != "disk" {
-		t.Errorf("DevType = %q; want disk", uevent.DevType)
-	}
-}
-
-func TestUEventListener_NewAndClose(t *testing.T) {
-	listener, err := NewUEventListener()
-	if err != nil {
-		t.Logf("NewUEventListener returned error (expected in unprivileged environment): %v", err)
-	} else {
-		defer listener.Close()
-		// Safe to close multiple times.
-		if err := listener.Close(); err != nil {
-			t.Errorf("expected close to be idempotent, got %v", err)
-		}
-	}
-
-	// Close on nil file.
-	nilListener := &UEventListener{file: nil}
-	if err := nilListener.Close(); err != nil {
-		t.Errorf("expected close on nil file to succeed, got %v", err)
-	}
-}
-
-func TestUEventListener_Listen_NilListener(t *testing.T) {
-	var l *UEventListener
-	if err := l.Listen(context.Background(), nil); err == nil {
-		t.Error("expected error for nil listener, got nil")
-	}
-
-	l2 := &UEventListener{file: nil}
-	if err := l2.Listen(context.Background(), nil); err == nil {
-		t.Error("expected error for listener with nil file, got nil")
-	}
-}
-
-func TestUEventListener_Listen_UnexpectedSocketClose(t *testing.T) {
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, 0)
-	if err != nil {
-		t.Fatalf("failed to create socketpair: %v", err)
-	}
-	rx := os.NewFile(uintptr(fds[0]), "rx")
-	tx := os.NewFile(uintptr(fds[1]), "tx")
-	defer tx.Close()
-
-	listener := &UEventListener{file: rx}
-	out := make(chan *UEvent, 1)
-
-	ctx := context.Background()
-	done := make(chan error, 1)
-	go func() {
-		done <- listener.Listen(ctx, out)
-	}()
-
-	packet := newUdevMessage("ACTION=add\x00DEVPATH=/devices/pci0000:00/block/sda\x00SUBSYSTEM=block\x00DEVNAME=/dev/sda\x00DEVTYPE=disk\x00")
-	if _, err := tx.Write(packet); err != nil {
-		t.Fatalf("failed to write uevent: %v", err)
-	}
-	select {
-	case <-out:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for listener to receive uevent")
-	}
-
-	// Context is NOT cancelled, but the active socket is closed unexpectedly.
-	_ = listener.Close()
-
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Error("expected non-nil error when socket is closed unexpectedly, got nil")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for Listen() to return on unexpected socket close")
-	}
-}
-
-func TestActionRescan_Constant(t *testing.T) {
-	if ActionRescan != "rescan" {
-		t.Errorf("ActionRescan = %q; want rescan", ActionRescan)
-	}
-}
-
-// TestUEventListener_Listen_Cancel verifies clean cancellation of the listen loop.
-//
-// Opening genuine AF_NETLINK sockets requires the CAP_NET_ADMIN capability or root privileges.
-// To test Listen() in unprivileged environments (like CI containers and user laptops),
-// we use unix.Socketpair(AF_UNIX, SOCK_SEQPACKET). SOCK_SEQPACKET emulates the exact
-// message-boundary-preserving datagram semantics of Netlink while operating completely in user space.
-func TestUEventListener_Listen_Cancel(t *testing.T) {
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, 0)
-	if err != nil {
-		t.Fatalf("failed to create socketpair: %v", err)
-	}
-	rx := os.NewFile(uintptr(fds[0]), "rx")
-	tx := os.NewFile(uintptr(fds[1]), "tx")
-	defer tx.Close()
-
-	listener := &UEventListener{file: rx}
-	out := make(chan *UEvent, 1)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	done := make(chan error, 1)
-	go func() {
-		done <- listener.Listen(ctx, out)
-	}()
-
-	// Cancelling context should exit Listen cleanly without blocking.
-	cancel()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Errorf("Listen() returned unexpected error on cancel: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for Listen() to return on cancel")
-	}
-}
-
-func TestUEventListener_Listen_RescansAfterTruncatedDatagram(t *testing.T) {
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, 0)
-	if err != nil {
-		t.Fatalf("failed to create socketpair: %v", err)
-	}
-	rx := os.NewFile(uintptr(fds[0]), "rx")
-	tx := os.NewFile(uintptr(fds[1]), "tx")
-	defer tx.Close()
-
-	listener := &UEventListener{file: rx}
-	out := make(chan *UEvent, 1)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	done := make(chan error, 1)
-	go func() {
-		done <- listener.Listen(ctx, out)
-	}()
-
-	if _, err := tx.Write(make([]byte, readBufferSize+1)); err != nil {
-		t.Fatalf("failed to write oversized uevent: %v", err)
-	}
-
-	select {
-	case event := <-out:
-		if event.Action != ActionRescan {
-			t.Errorf("Action = %q; want %q", event.Action, ActionRescan)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for rescan after truncated uevent")
-	}
-
-	cancel()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Errorf("Listen() returned unexpected error on cancel: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for Listen() to return on cancel")
-	}
-}
-
-// TestUEventListener_Listen_ReceivesEvent verifies that valid block uevents sent over
-// the socket are properly decoded and forwarded to the output channel.
-func TestUEventListener_Listen_ReceivesEvent(t *testing.T) {
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, 0)
-	if err != nil {
-		t.Fatalf("failed to create socketpair: %v", err)
-	}
-	rx := os.NewFile(uintptr(fds[0]), "rx")
-	tx := os.NewFile(uintptr(fds[1]), "tx")
-	defer tx.Close()
-
-	listener := &UEventListener{file: rx}
-	out := make(chan *UEvent, 2)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	done := make(chan error, 1)
-	go func() {
-		done <- listener.Listen(ctx, out)
-	}()
-
-	// 1. Send invalid/non-udev packet (should be skipped silently).
-	_, err = tx.Write([]byte("garbage_data"))
-	if err != nil {
-		t.Fatalf("failed to write garbage: %v", err)
-	}
-
-	// 2. Send non-block subsystem packet (should be dropped).
-	netMsg := newUdevMessage("ACTION=add\x00DEVPATH=/devices/pci/net/eth0\x00SUBSYSTEM=net\x00DEVNAME=eth0\x00")
-	_, err = tx.Write(netMsg)
-	if err != nil {
-		t.Fatalf("failed to write net uevent: %v", err)
-	}
-
-	// 3. Send valid block device event.
-	blockMsg := newUdevMessage("ACTION=add\x00DEVPATH=/devices/pci0000:00/block/sda\x00SUBSYSTEM=block\x00DEVNAME=/dev/sda\x00DEVTYPE=disk\x00")
-	_, err = tx.Write(blockMsg)
-	if err != nil {
-		t.Fatalf("failed to write block uevent: %v", err)
-	}
-
-	select {
-	case ev := <-out:
-		if ev.Action != "add" {
-			t.Errorf("expected Action=add, got %q", ev.Action)
-		}
-		if ev.KernelName() != "sda" {
-			t.Errorf("expected KernelName=sda, got %q", ev.KernelName())
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for block uevent")
-	}
-
-	cancel()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Errorf("Listen() returned unexpected error: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for Listen() to return on cancel")
-	}
-}
-
-func TestVerifySender(t *testing.T) {
+func TestIsDiskChange(t *testing.T) {
 	tests := []struct {
 		name string
-		from unix.Sockaddr
-		oob  []byte
-		want error
+		env  map[string]string
+		want bool
 	}{
-		{
-			name: "reject non-netlink sender",
-			from: &unix.SockaddrInet4{},
-			want: ErrUntrustedSender,
-		},
-		{
-			name: "reject wrong multicast group",
-			from: &unix.SockaddrNetlink{Groups: 1},
-			want: ErrUntrustedSender,
-		},
-		{
-			name: "reject missing credentials",
-			from: &unix.SockaddrNetlink{Groups: udevEventGroup},
-			want: ErrUntrustedSender,
-		},
-		{
-			name: "accept kernel credentials",
-			from: &unix.SockaddrNetlink{Groups: udevEventGroup},
-			oob:  unix.UnixCredentials(&unix.Ucred{Pid: 0, Uid: 0}),
-		},
-		{
-			name: "reject unprivileged credentials",
-			from: &unix.SockaddrNetlink{Groups: udevEventGroup},
-			oob:  unix.UnixCredentials(&unix.Ucred{Pid: 1234, Uid: 1000}),
-			want: ErrUntrustedSender,
-		},
-		{
-			name: "accept udev daemon root credentials",
-			from: &unix.SockaddrNetlink{Groups: udevEventGroup},
-			oob:  unix.UnixCredentials(&unix.Ucred{Pid: 4242, Uid: 0}),
-			want: nil,
-		},
-		{
-			name: "reject corrupt control message",
-			from: &unix.SockaddrNetlink{Groups: udevEventGroup},
-			oob:  []byte{1, 2, 3},
-			want: ErrUntrustedSender,
-		},
-		{
-			name: "accept mock unix socketpair in tests",
-			from: &unix.SockaddrUnix{},
-			want: nil,
-		},
+		{"disk added", map[string]string{"ACTION": "add", "SUBSYSTEM": "block", "DEVTYPE": "disk", "DEVPATH": "/devices/x/block/sda"}, true},
+		{"disk removed", map[string]string{"ACTION": "remove", "SUBSYSTEM": "block", "DEVTYPE": "disk", "DEVPATH": "/devices/x/block/nvme0n1"}, true},
+		{"change is ignored", map[string]string{"ACTION": "change", "SUBSYSTEM": "block", "DEVTYPE": "disk", "DEVPATH": "/devices/x/block/sda"}, false},
+		{"partition", map[string]string{"ACTION": "add", "SUBSYSTEM": "block", "DEVTYPE": "partition", "DEVPATH": "/devices/x/block/sda/sda1"}, false},
+		{"other subsystem", map[string]string{"ACTION": "add", "SUBSYSTEM": "net", "DEVPATH": "/devices/x/net/eth0"}, false},
+		{"loop device", map[string]string{"ACTION": "add", "SUBSYSTEM": "block", "DEVTYPE": "disk", "DEVPATH": "/devices/virtual/block/loop3"}, false},
+		{"iscsi disk", map[string]string{"ACTION": "add", "SUBSYSTEM": "block", "DEVTYPE": "disk", "DEVPATH": "/devices/x/block/sdb", "ID_BUS": "iscsi"}, false},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := verifySender(tt.from, tt.oob)
-			if !errors.Is(err, tt.want) {
-				t.Errorf("verifySender() error = %v; want %v", err, tt.want)
+			if got := isDiskChange(tt.env); got != tt.want {
+				t.Errorf("isDiskChange() = %t; want %t", got, tt.want)
 			}
 		})
+	}
+}
+
+// startListen runs listen against one end of a SOCK_SEQPACKET socketpair, which
+// keeps message boundaries like netlink datagrams without needing privileges. It
+// returns the sending end, a trigger counter and the result channel of listen.
+func startListen(t *testing.T, ctx context.Context) (tx *os.File, triggers *atomic.Int32, done chan error) {
+	t.Helper()
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, 0)
+	if err != nil {
+		t.Fatalf("socketpair: %v", err)
+	}
+	rx := os.NewFile(uintptr(fds[0]), "rx")
+	tx = os.NewFile(uintptr(fds[1]), "tx")
+	t.Cleanup(func() { _ = tx.Close() })
+
+	triggers = new(atomic.Int32)
+	done = make(chan error, 1)
+	go func() { done <- listen(ctx, rx, func() { triggers.Add(1) }) }()
+	return tx, triggers, done
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestListen(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tx, triggers, done := startListen(t, ctx)
+
+	// A bound socket triggers once, so changes before the bind are picked up.
+	waitFor(t, "trigger after bind", func() bool { return triggers.Load() == 1 })
+
+	// None of these may trigger.
+	for _, msg := range [][]byte{
+		[]byte("garbage"),
+		newUdevMessage("ACTION=add\x00DEVPATH=/devices/pci/net/eth0\x00SUBSYSTEM=net\x00"),
+		blockEvent("change", "sda"),
+	} {
+		if _, err := tx.Write(msg); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	// Events are processed in order, so once this one is seen all before it were.
+	if _, err := tx.Write(blockEvent("add", "sda")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	waitFor(t, "trigger for add", func() bool { return triggers.Load() >= 2 })
+	if got := triggers.Load(); got != 2 {
+		t.Errorf("triggers = %d; want 2 (bind, add)", got)
+	}
+
+	if _, err := tx.Write(blockEvent("remove", "sda")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	waitFor(t, "trigger for remove", func() bool { return triggers.Load() == 3 })
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("listen returned %v on cancel; want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("listen did not return after cancel")
+	}
+}
+
+func TestListenRescansAfterTruncatedDatagram(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tx, triggers, _ := startListen(t, ctx)
+	waitFor(t, "trigger after bind", func() bool { return triggers.Load() == 1 })
+
+	if _, err := tx.Write(make([]byte, maxMsg+1)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	waitFor(t, "rescan after truncation", func() bool { return triggers.Load() == 2 })
+}
+
+// dialInPrivateNetns returns a socket from dial and a second one that sends to
+// the udev group, both in a new network namespace. That isolates the test from
+// the real udev events of the host, even when it runs as root. Creating the
+// namespace needs CAP_SYS_ADMIN, e.g. "unshare -Ur go test ./pkg/discovery".
+func dialInPrivateNetns(t *testing.T) (rx *os.File, send func(msg []byte)) {
+	t.Helper()
+	type result struct {
+		rx  *os.File
+		fd  int
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		// The thread is never unlocked, so it ends with this goroutine instead
+		// of returning to the pool while it is in the foreign namespace.
+		runtime.LockOSThread()
+		if err := unix.Unshare(unix.CLONE_NEWNET); err != nil {
+			ch <- result{err: err}
+			return
+		}
+		rx, err := dial()
+		if err != nil {
+			ch <- result{err: err}
+			return
+		}
+		fd, err := unix.Socket(unix.AF_NETLINK, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.NETLINK_KOBJECT_UEVENT)
+		if err != nil {
+			_ = rx.Close()
+		}
+		ch <- result{rx, fd, err}
+	}()
+
+	r := <-ch
+	if r.err != nil {
+		t.Skipf("cannot create a network namespace: %v", r.err)
+	}
+	t.Cleanup(func() { _ = unix.Close(r.fd) })
+	return r.rx, func(msg []byte) {
+		t.Helper()
+		// Only a privileged process may send to a netlink multicast group.
+		if err := unix.Sendto(r.fd, msg, 0, &unix.SockaddrNetlink{Family: unix.AF_NETLINK, Groups: groupUdev}); err != nil {
+			t.Fatalf("send to udev group: %v", err)
+		}
+	}
+}
+
+// TestListenOnNetlink runs listen against a real netlink socket that receives
+// from the multicast group like in production.
+func TestListenOnNetlink(t *testing.T) {
+	rx, send := dialInPrivateNetns(t)
+	var triggers atomic.Int32
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- listen(ctx, rx, func() { triggers.Add(1) }) }()
+	waitFor(t, "trigger after bind", func() bool { return triggers.Load() == 1 })
+
+	send([]byte("garbage"))
+	send(blockEvent("change", "sda"))
+	send(blockEvent("add", "sda"))
+	waitFor(t, "trigger for add", func() bool { return triggers.Load() >= 2 })
+	send(blockEvent("remove", "sda"))
+	waitFor(t, "trigger for remove", func() bool { return triggers.Load() == 3 })
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Errorf("listen returned %v on cancel; want nil", err)
+	}
+}
+
+// TestListenRescansAfterOverflow fills the receive queue of a real netlink
+// socket, which makes the kernel drop messages and fail the next read with
+// ENOBUFS, and expects a rescan trigger plus a working socket afterwards.
+func TestListenRescansAfterOverflow(t *testing.T) {
+	rx, send := dialInPrivateNetns(t)
+
+	// A small queue overflows after a few messages.
+	rc, err := rx.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sockErr error
+	if err := rc.Control(func(fd uintptr) {
+		sockErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, 4096)
+	}); err != nil || sockErr != nil {
+		t.Fatalf("shrink receive buffer: %v %v", err, sockErr)
+	}
+
+	// listen is held in its first trigger, so nothing is read while the queue
+	// is filled with messages that do not trigger by themselves.
+	var triggers atomic.Int32
+	release := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- listen(ctx, rx, func() {
+			if triggers.Add(1) == 1 {
+				<-release
+			}
+		})
+	}()
+	waitFor(t, "trigger after bind", func() bool { return triggers.Load() == 1 })
+
+	netEvent := newUdevMessage("ACTION=add\x00DEVPATH=/devices/pci/net/eth0\x00SUBSYSTEM=net\x00")
+	for range 200 {
+		send(netEvent)
+	}
+	close(release)
+
+	waitFor(t, "rescan after overflow", func() bool { return triggers.Load() == 2 })
+	send(blockEvent("add", "sda"))
+	waitFor(t, "trigger for add after overflow", func() bool { return triggers.Load() == 3 })
+	cancel()
+	if err := <-done; err != nil {
+		t.Errorf("listen returned %v on cancel; want nil", err)
+	}
+}
+
+// Binding the real netlink group needs no privileges (the uevent socket sets
+// NL_CFG_F_NONROOT_RECV); a bound Monitor triggers once before it sees any event.
+func TestMonitorTriggersAfterBindAndStopsOnCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var triggers atomic.Int32
+	done := make(chan error, 1)
+	go func() { done <- Monitor(ctx, func() { triggers.Add(1) }) }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for triggers.Load() == 0 {
+		select {
+		case err := <-done:
+			t.Skipf("netlink socket unavailable: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Monitor did not trigger after binding")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Monitor returned %v on cancel; want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Monitor did not return after cancel")
 	}
 }
